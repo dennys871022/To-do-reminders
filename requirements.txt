@@ -1,0 +1,5 @@
+streamlit>=1.38
+gspread>=6.1
+google-auth>=2.32
+requests>=2.32
+pandas>=2.2
