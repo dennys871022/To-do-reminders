@@ -5,13 +5,15 @@ reminder_check.py
 真正的「定時執行」交給 GitHub Actions（見 .github/workflows/reminder.yml），
 每次觸發就跑一次這支腳本。
 
-判斷邏輯（沿用原本 HTML 版本的設計）：
+判斷邏輯：
 - 非常緊急：每 2 小時提醒一次
 - 緊急：每 4 小時提醒一次
 - 一般：不提醒
 - 已完成的事項不提醒
-- 以「上次提醒時間」(last_reminder_at) 或「建立時間」(created_at) 為基準，
-  超過對應間隔就再推播一次，並更新 last_reminder_at
+- 從來沒提醒過的事項（last_reminder_at 是空的），不管建立多久了，
+  這次執行就會立刻提醒一次（第一次提醒不看建立時間，讓緊急事項一建立、
+  排程一跑就會通知，符合直覺）
+- 提醒過之後，之後每次都以「上次提醒時間」為基準，超過對應間隔才再提醒一次
 """
 
 from datetime import datetime, timezone
@@ -52,13 +54,13 @@ def main():
         if not interval_hours:
             continue
 
-        base = _parse_iso(t.get("last_reminder_at")) or _parse_iso(t.get("created_at"))
-        if base is None:
-            # 沒有任何時間戳可以比對，保守起見直接視為到期，先提醒一次
+        last_reminder = _parse_iso(t.get("last_reminder_at"))
+        if last_reminder is None:
+            # 從來沒提醒過：不管建立多久了，馬上提醒一次
             due.append(t)
             continue
 
-        elapsed_hours = (now - base).total_seconds() / 3600
+        elapsed_hours = (now - last_reminder).total_seconds() / 3600
         if elapsed_hours >= interval_hours:
             due.append(t)
 
