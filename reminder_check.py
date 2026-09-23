@@ -18,8 +18,10 @@ from line_notify import send_line_group_message_with_button
 
 TZ = ZoneInfo("Asia/Taipei")
 
-# 判斷「現在」是否命中某個時段，允許正負 10 分鐘 的誤差
-SLOT_TOLERANCE_MINUTES = 10
+# 判斷「現在」是否命中某個時段，允許正負 20 分鐘 的誤差
+# （GitHub Actions 的 schedule 觸發本來就不保證準時，尖峰時段延遲 15~30 分鐘很常見，
+#  容許範圍抓寬一點，避免延遲導致整個錯過時段而漏發）
+SLOT_TOLERANCE_MINUTES = 20
 
 # 你的 Streamlit App 網址，按鈕點下去會開啟這裡
 # ⚠️ 請確認這個網址是不是你目前實際部署的網址，如果不是請改成正確的
