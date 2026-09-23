@@ -107,15 +107,39 @@ def _drive_service():
     return build("drive", "v3", credentials=creds)
 
 
+def _get_drive_folder_id():
+    try:
+        import streamlit as st
+        if "GOOGLE_DRIVE_FOLDER_ID" in st.secrets:
+            return st.secrets["GOOGLE_DRIVE_FOLDER_ID"]
+    except Exception:
+        pass
+    return os.environ.get("GOOGLE_DRIVE_FOLDER_ID")
+
+
 def upload_image(file_bytes, filename, mime_type):
     """
-    把圖片上傳到服務帳號的 Google Drive，設成「知道連結的人都能看」，
-    回傳一個可以直接用 st.image() 顯示的網址。
+    把圖片上傳到 Google Drive 的指定資料夾（GOOGLE_DRIVE_FOLDER_ID），
+    設成「知道連結的人都能看」，回傳一個可以直接用 st.image() 顯示的網址。
+
+    【重要】服務帳號本身沒有 Drive 儲存空間（容量是 0），一定要指定一個
+    屬於「真人 Google 帳號」且已分享給服務帳號編輯權限的資料夾當作 parent，
+    上傳的檔案才會算進那個真人帳號的容量，不然一定會報錯。
     """
+    folder_id = _get_drive_folder_id()
+    if not folder_id:
+        raise RuntimeError(
+            "找不到 GOOGLE_DRIVE_FOLDER_ID。服務帳號本身沒有 Drive 儲存空間，"
+            "請先在你自己的 Google Drive 建一個資料夾、分享給服務帳號編輯權限，"
+            "再把資料夾 ID 設進 secrets 的 GOOGLE_DRIVE_FOLDER_ID。"
+        )
+
     service = _drive_service()
     media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mime_type, resumable=False)
     file = service.files().create(
-        body={"name": filename}, media_body=media, fields="id"
+        body={"name": filename, "parents": [folder_id]},
+        media_body=media,
+        fields="id",
     ).execute()
     file_id = file["id"]
     service.permissions().create(
