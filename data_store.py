@@ -17,8 +17,12 @@ import time
 import uuid
 from datetime import datetime, timezone
 
+import io
+
 import gspread
 from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -28,8 +32,15 @@ SCOPES = [
 TODO_HEADERS = [
     "id", "start_date", "end_date", "task", "location", "urgency",
     "work_item", "type", "completed", "created_at", "last_reminder_at",
+    "image_url",
 ]
 EXP_HEADERS = ["id", "work_item", "source", "details", "mistakes", "created_at"]
+OPTION_HEADERS = ["category", "value"]
+
+DEFAULT_OPTIONS = {
+    "work_item": ["泥作", "木作", "水電", "連續壁"],
+    "type": ["叫料", "派工", "查驗"],
+}
 
 
 def _get_credentials():
@@ -90,6 +101,30 @@ def _open_spreadsheet():
     return gc.open_by_key(_get_sheet_id())
 
 
+@_cache_resource()
+def _drive_service():
+    creds = _get_credentials()
+    return build("drive", "v3", credentials=creds)
+
+
+def upload_image(file_bytes, filename, mime_type):
+    """
+    把圖片上傳到服務帳號的 Google Drive，設成「知道連結的人都能看」，
+    回傳一個可以直接用 st.image() 顯示的網址。
+    """
+    service = _drive_service()
+    media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mime_type, resumable=False)
+    file = service.files().create(
+        body={"name": filename}, media_body=media, fields="id"
+    ).execute()
+    file_id = file["id"]
+    service.permissions().create(
+        fileId=file_id, body={"role": "reader", "type": "anyone"}
+    ).execute()
+    # 用縮圖網址格式，比 uc?export=view 更穩定，Streamlit 的 st.image() 嵌入顯示比較不會失敗
+    return f"https://drive.google.com/thumbnail?id={file_id}&sz=w1000"
+
+
 def _get_or_create_worksheet(ss, title, headers):
     try:
         ws = ss.worksheet(title)
@@ -133,7 +168,7 @@ def get_todos():
     return records
 
 
-def add_todo(start_date, end_date, task, location, work_item, type_):
+def add_todo(start_date, end_date, task, location, work_item, type_, image_url=""):
     """新增代辦事項。緊急程度不再由使用者傳入，一律由到期日自動判定。"""
     ws = _todo_ws()
     row = {
@@ -148,6 +183,7 @@ def add_todo(start_date, end_date, task, location, work_item, type_):
         "completed": "FALSE",
         "created_at": _now_iso(),
         "last_reminder_at": "",
+        "image_url": image_url,
     }
     ws.append_row([row[h] for h in TODO_HEADERS])
     return row
@@ -213,3 +249,43 @@ def delete_experience(exp_id):
     idx = _find_row_index(ws, EXP_HEADERS, exp_id)
     if idx:
         ws.delete_rows(idx)
+
+
+# ---------------- 選單選項（工項／類型） ----------------
+
+def _option_ws():
+    ws = _get_or_create_worksheet(_open_spreadsheet(), "Options", OPTION_HEADERS)
+    # 第一次使用、表是空的時候，塞入預設選項
+    if len(ws.get_all_values()) <= 1:
+        rows = []
+        for category, values in DEFAULT_OPTIONS.items():
+            for v in values:
+                rows.append([category, v])
+        if rows:
+            ws.append_rows(rows)
+    return ws
+
+
+def get_options(category):
+    ws = _option_ws()
+    records = ws.get_all_records(expected_headers=OPTION_HEADERS)
+    return [r["value"] for r in records if r["category"] == category]
+
+
+def add_option(category, value):
+    value = value.strip()
+    if not value:
+        return
+    if value in get_options(category):
+        return
+    ws = _option_ws()
+    ws.append_row([category, value])
+
+
+def delete_option(category, value):
+    ws = _option_ws()
+    records = ws.get_all_records(expected_headers=OPTION_HEADERS)
+    for i, r in enumerate(records, start=2):  # 第 1 列是標題，資料從第 2 列開始
+        if r["category"] == category and r["value"] == value:
+            ws.delete_rows(i)
+            return
