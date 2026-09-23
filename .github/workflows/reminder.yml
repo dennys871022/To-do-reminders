@@ -2,8 +2,12 @@ name: LINE 代辦提醒排程
 
 on:
   schedule:
-    # 每小時的第 0 分執行一次（UTC 時間，台灣時間 = UTC+8）
-    - cron: "0 * * * *"
+    # 台灣時間 08:00 = UTC 00:00
+    - cron: "0 0 * * *"
+    # 台灣時間 13:30 = UTC 05:30
+    - cron: "30 5 * * *"
+    # 台灣時間 17:00 = UTC 09:00
+    - cron: "0 9 * * *"
   workflow_dispatch: {}   # 允許在 GitHub 網頁上手動觸發，方便測試
 
 jobs:
