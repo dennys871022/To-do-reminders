@@ -3,14 +3,9 @@ data_store.py
 --------------
 統一封裝所有資料讀寫邏輯（目前用 Google Sheets 當資料庫）。
 
-之後如果要換成 Supabase / SQLite，只需要改這支檔案裡的實作，
-app.py 跟 reminder_check.py 都不用動，因為它們只呼叫這裡定義的函式。
-
-需要的憑證：一個 Google 服務帳號（Service Account）的 JSON 金鑰，
-並把該服務帳號的 email 加入你的 Google Sheet 的共用權限（編輯者）。
-
-本機開發：把金鑰內容放進 .streamlit/secrets.toml
-GitHub Actions：把金鑰內容放進 repo 的 Secrets，用環境變數 GOOGLE_SERVICE_ACCOUNT_JSON 帶入
+【這版新增】用 st.cache_resource 快取連線物件跟試算表物件，
+避免 Streamlit 每次互動（按按鈕、切頁籤）都重新整支腳本重跑時，
+重複呼叫 Google API 導致觸發 API 頻率限制（rate limit）而報錯。
 """
 
 import os
@@ -35,11 +30,6 @@ EXP_HEADERS = ["id", "work_item", "source", "details", "mistakes", "created_at"]
 
 
 def _get_credentials():
-    """
-    支援兩種來源：
-    1. Streamlit secrets（本機 / Streamlit Cloud 執行 app.py 時）
-    2. 環境變數 GOOGLE_SERVICE_ACCOUNT_JSON（GitHub Actions 執行 reminder_check.py 時）
-    """
     try:
         import streamlit as st
         if "gcp_service_account" in st.secrets:
@@ -73,11 +63,28 @@ def _get_sheet_id():
     return sheet_id
 
 
+def _cache_resource(ttl=None):
+    """
+    在 Streamlit 環境下用 st.cache_resource 包裝；
+    在非 Streamlit 環境（例如 GitHub Actions 執行 reminder_check.py）
+    直接跳過快取，因為那邊本來就是跑一次就結束，不需要快取。
+    """
+    try:
+        import streamlit as st
+        return st.cache_resource(ttl=ttl)
+    except Exception:
+        def _noop(func):
+            return func
+        return _noop
+
+
+@_cache_resource()
 def _client():
     creds = _get_credentials()
     return gspread.authorize(creds)
 
 
+@_cache_resource(ttl=300)  # 5 分鐘內重複開啟同一份表，直接用快取，不重新打 API
 def _open_spreadsheet():
     gc = _client()
     return gc.open_by_key(_get_sheet_id())
