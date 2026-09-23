@@ -27,23 +27,21 @@ def _init_state():
 
 
 def _select_with_add(label, category, key):
-    """下拉選單 + 「自行新增」功能。選項存在 Google Sheets 的 Options 分頁，
-    新增一次之後，所有人、下次打開都會看到，不會因為重新整理就消失。"""
-    options = data_store.get_options(category) + ["＋ 自行新增..."]
-    choice = st.selectbox(label, options, key=key)
-    if choice == "＋ 自行新增...":
-        new_val = st.text_input(f"輸入新的{label}", key=f"{key}_new")
-        if new_val.strip():
-            data_store.add_option(category, new_val.strip())
-            return new_val.strip()
+    """純下拉選單，選項存在 Google Sheets 的 Options 分頁。
+    要新增新選項，請到上方「⚙️ 管理工項／類型選單」新增（不能在這個表單裡直接打新選項，
+    因為 Streamlit 表單裡的元件不會即時刷新，體驗上會像打不進去）。"""
+    options = data_store.get_options(category)
+    if not options:
+        st.warning(f"目前沒有{label}選項，請先到上方「⚙️ 管理工項／類型選單」新增。")
         return ""
-    return choice
+    return st.selectbox(label, options, key=key)
 
 
 def render_option_manager():
-    """管理工項／類型選項：可以刪掉不要的選項。"""
-    with st.expander("⚙️ 管理工項／類型選單"):
+    """管理工項／類型選項：新增、刪除都在這裡做（表單外，才能即時刷新）。"""
+    with st.expander("⚙️ 管理工項／類型選單", expanded=False):
         col1, col2 = st.columns(2)
+
         with col1:
             st.markdown("**工項**")
             for v in data_store.get_options("work_item"):
@@ -52,6 +50,13 @@ def render_option_manager():
                 if c2.button("🗑", key=f"del_work_item_{v}"):
                     data_store.delete_option("work_item", v)
                     st.rerun()
+            with st.form("add_work_item_form", clear_on_submit=True):
+                new_work_item = st.text_input("新增工項", key="new_work_item_input")
+                if st.form_submit_button("新增"):
+                    if new_work_item.strip():
+                        data_store.add_option("work_item", new_work_item.strip())
+                        st.rerun()
+
         with col2:
             st.markdown("**類型**")
             for v in data_store.get_options("type"):
@@ -60,6 +65,12 @@ def render_option_manager():
                 if c2.button("🗑", key=f"del_type_{v}"):
                     data_store.delete_option("type", v)
                     st.rerun()
+            with st.form("add_type_form", clear_on_submit=True):
+                new_type = st.text_input("新增類型", key="new_type_input")
+                if st.form_submit_button("新增"):
+                    if new_type.strip():
+                        data_store.add_option("type", new_type.strip())
+                        st.rerun()
 
 
 def render_todo_tab():
