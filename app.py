@@ -1,29 +1,27 @@
 """
 app.py
 -------
-營造管理系統 - Streamlit 版本（MVP）
+營造管理系統 - Streamlit 版本
 
-功能對應原本 HTML 版本：
-- 代辦事項：新增 / 編輯 / 刪除 / 標記完成，含日期區間、地點、緊急程度、工項、類型、附圖
-- 經驗分享：新增 / 刪除 / 依工項篩選
-
-跟原本 HTML 版最大的不同：
-- 資料存在 Google Sheets（多人、多裝置都看得到同一份資料）
-- 「圖片標註畫布」這版先簡化成單純上傳圖片，之後可以加 streamlit-drawable-canvas 套件補回標註功能
-- LINE 提醒改由獨立的 GitHub Actions 排程（reminder_check.py）負責，跟這個網頁介面是分開執行的
+【這版改版重點】
+拿掉「緊急程度」手動下拉選單。緊急程度現在完全由 urgency.py 依「結束日期」
+自動判定（3 天內=非常緊急／本週內=緊急／本月內=一般），清單畫面上會即時顯示
+目前的分級標籤，不需要使用者自己選、也不會選錯。
 """
 
 import streamlit as st
-import pandas as pd
 from datetime import date
+from zoneinfo import ZoneInfo
 
 import data_store
+import urgency
 
 st.set_page_config(page_title="營造管理系統", page_icon="🏗️", layout="wide")
 
 DEFAULT_WORK_ITEMS = ["泥作", "木作", "水電", "連續壁"]
 DEFAULT_TYPES = ["叫料", "派工", "查驗"]
-URGENCY_OPTIONS = ["非常緊急", "緊急", "一般"]
+
+TZ = ZoneInfo("Asia/Taipei")
 
 
 def _init_state():
@@ -36,7 +34,7 @@ def _init_state():
 
 
 def _select_with_add(label, options_key, key):
-    """下拉選單 + 「自行新增」功能，模擬原本 HTML 版的 workItemSelect / typeSelect。"""
+    """下拉選單 + 「自行新增」功能。"""
     options = st.session_state[options_key] + ["＋ 自行新增..."]
     choice = st.selectbox(label, options, key=key)
     if choice == "＋ 自行新增...":
@@ -66,17 +64,13 @@ def render_todo_tab():
             )
         with col2:
             end_date = st.date_input(
-                "結束日期",
+                "結束日期（緊急程度會依這個日期自動判定）",
                 value=date.fromisoformat(editing["end_date"]) if editing else date.today(),
             )
 
         task = st.text_input("事項說明", value=editing["task"] if editing else "")
         location = st.text_input(
             "地點（例如：B1停車場、3樓東側）", value=editing["location"] if editing else ""
-        )
-        urgency = st.selectbox(
-            "緊急程度", URGENCY_OPTIONS,
-            index=URGENCY_OPTIONS.index(editing["urgency"]) if editing else URGENCY_OPTIONS.index("一般"),
         )
 
         work_item = _select_with_add("工項", "work_items", "work_item_select")
@@ -109,7 +103,7 @@ def render_todo_tab():
                 data_store.update_todo(
                     editing["id"],
                     start_date=str(start_date), end_date=str(end_date),
-                    task=task, location=location, urgency=urgency,
+                    task=task, location=location,
                     work_item=work_item, type=type_,
                     last_reminder_at="",  # 內容更新後重新起算提醒週期
                 )
@@ -118,7 +112,7 @@ def render_todo_tab():
             else:
                 data_store.add_todo(
                     str(start_date), str(end_date), task, location,
-                    urgency, work_item, type_,
+                    work_item, type_,
                 )
                 st.success("已新增事項")
             st.rerun()
@@ -131,18 +125,29 @@ def render_todo_tab():
         st.info("目前沒有代辦事項。")
         return
 
-    for t in todos:
+    today = datetime_now_taipei_date()
+
+    # 依緊急程度排序：非常緊急 > 緊急 > 一般 > 尚未進入提醒範圍
+    def _sort_key(t):
+        tier = urgency.classify_tier(t["end_date"], today)
+        if tier in urgency.TIER_ORDER:
+            return urgency.TIER_ORDER.index(tier)
+        return len(urgency.TIER_ORDER)
+
+    todos_sorted = sorted(todos, key=_sort_key)
+
+    for t in todos_sorted:
         completed = str(t.get("completed", "")).strip().upper() == "TRUE"
-        urgency_icon = {"非常緊急": "🔴", "緊急": "🟠", "一般": "⚪"}.get(t["urgency"], "⚪")
+        label = urgency.tier_label(t["end_date"], today)
         date_range = t["start_date"] if t["start_date"] == t["end_date"] else f"{t['start_date']} ~ {t['end_date']}"
-        title = f"{urgency_icon} {'~~' if completed else ''}{t['task']}{'~~' if completed else ''}"
+        title = f"{label} {'~~' if completed else ''}{t['task']}{'~~' if completed else ''}"
 
         with st.expander(title):
             st.write(f"**期限：** {date_range}")
             st.write(f"**工項／類型：** {t['work_item']} ／ {t['type']}")
             if t.get("location"):
                 st.write(f"**地點：** {t['location']}")
-            st.write(f"**緊急程度：** {t['urgency']}")
+            st.write(f"**目前分級：** {label}")
 
             c1, c2, c3 = st.columns(3)
             if c1.button("標記完成" if not completed else "取消完成", key=f"done_{t['id']}"):
@@ -191,6 +196,11 @@ def render_experience_tab():
             if st.button("刪除", key=f"expdel_{e['id']}"):
                 data_store.delete_experience(e["id"])
                 st.rerun()
+
+
+def datetime_now_taipei_date():
+    import datetime as _dt
+    return _dt.datetime.now(TZ).date()
 
 
 def main():
