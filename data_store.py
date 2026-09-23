@@ -1,11 +1,14 @@
 """
 data_store.py
 --------------
-統一封裝所有資料讀寫邏輯（目前用 Google Sheets 當資料庫）。
+統一封裝所有資料讀寫邏輯（用 Google Sheets 當資料庫）。
 
-【這版新增】用 st.cache_resource 快取連線物件跟試算表物件，
-避免 Streamlit 每次互動（按按鈕、切頁籤）都重新整支腳本重跑時，
-重複呼叫 Google API 導致觸發 API 頻率限制（rate limit）而報錯。
+用 st.cache_resource 快取連線物件跟試算表物件，避免 Streamlit 每次互動都重新
+整支腳本重跑時，重複呼叫 Google API 導致觸發 API 頻率限制。
+
+注意：TODO_HEADERS 裡仍保留 "urgency" 欄位以維持既有 Google Sheet 的欄位結構
+不被打亂，但這個欄位現在已經不由使用者手動選擇、也不影響提醒排程——
+實際的緊急程度分級一律由 urgency.py 依「結束日期」即時計算。
 """
 
 import os
@@ -64,11 +67,8 @@ def _get_sheet_id():
 
 
 def _cache_resource(ttl=None):
-    """
-    在 Streamlit 環境下用 st.cache_resource 包裝；
-    在非 Streamlit 環境（例如 GitHub Actions 執行 reminder_check.py）
-    直接跳過快取，因為那邊本來就是跑一次就結束，不需要快取。
-    """
+    """在 Streamlit 環境下用 st.cache_resource 包裝；非 Streamlit 環境（例如
+    GitHub Actions 執行 reminder_check.py）直接跳過快取，因為那邊跑一次就結束。"""
     try:
         import streamlit as st
         return st.cache_resource(ttl=ttl)
@@ -84,7 +84,7 @@ def _client():
     return gspread.authorize(creds)
 
 
-@_cache_resource(ttl=300)  # 5 分鐘內重複開啟同一份表，直接用快取，不重新打 API
+@_cache_resource(ttl=300)
 def _open_spreadsheet():
     gc = _client()
     return gc.open_by_key(_get_sheet_id())
@@ -133,7 +133,8 @@ def get_todos():
     return records
 
 
-def add_todo(start_date, end_date, task, location, urgency, work_item, type_):
+def add_todo(start_date, end_date, task, location, work_item, type_):
+    """新增代辦事項。緊急程度不再由使用者傳入，一律由到期日自動判定。"""
     ws = _todo_ws()
     row = {
         "id": _gen_id("todo"),
@@ -141,7 +142,7 @@ def add_todo(start_date, end_date, task, location, urgency, work_item, type_):
         "end_date": end_date,
         "task": task,
         "location": location,
-        "urgency": urgency,
+        "urgency": "",  # 不再使用，保留欄位只為了不打亂既有試算表結構
         "work_item": work_item,
         "type": type_,
         "completed": "FALSE",
