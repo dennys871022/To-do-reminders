@@ -18,36 +18,53 @@ import urgency
 
 st.set_page_config(page_title="營造管理系統", page_icon="🏗️", layout="wide")
 
-DEFAULT_WORK_ITEMS = ["泥作", "木作", "水電", "連續壁"]
-DEFAULT_TYPES = ["叫料", "派工", "查驗"]
-
 TZ = ZoneInfo("Asia/Taipei")
 
 
 def _init_state():
-    if "work_items" not in st.session_state:
-        st.session_state.work_items = list(DEFAULT_WORK_ITEMS)
-    if "types" not in st.session_state:
-        st.session_state.types = list(DEFAULT_TYPES)
     if "editing_id" not in st.session_state:
         st.session_state.editing_id = None
 
 
-def _select_with_add(label, options_key, key):
-    """下拉選單 + 「自行新增」功能。"""
-    options = st.session_state[options_key] + ["＋ 自行新增..."]
+def _select_with_add(label, category, key):
+    """下拉選單 + 「自行新增」功能。選項存在 Google Sheets 的 Options 分頁，
+    新增一次之後，所有人、下次打開都會看到，不會因為重新整理就消失。"""
+    options = data_store.get_options(category) + ["＋ 自行新增..."]
     choice = st.selectbox(label, options, key=key)
     if choice == "＋ 自行新增...":
         new_val = st.text_input(f"輸入新的{label}", key=f"{key}_new")
-        if new_val:
-            if new_val not in st.session_state[options_key]:
-                st.session_state[options_key].append(new_val)
-            return new_val
+        if new_val.strip():
+            data_store.add_option(category, new_val.strip())
+            return new_val.strip()
         return ""
     return choice
 
 
+def render_option_manager():
+    """管理工項／類型選項：可以刪掉不要的選項。"""
+    with st.expander("⚙️ 管理工項／類型選單"):
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**工項**")
+            for v in data_store.get_options("work_item"):
+                c1, c2 = st.columns([4, 1])
+                c1.write(v)
+                if c2.button("🗑", key=f"del_work_item_{v}"):
+                    data_store.delete_option("work_item", v)
+                    st.rerun()
+        with col2:
+            st.markdown("**類型**")
+            for v in data_store.get_options("type"):
+                c1, c2 = st.columns([4, 1])
+                c1.write(v)
+                if c2.button("🗑", key=f"del_type_{v}"):
+                    data_store.delete_option("type", v)
+                    st.rerun()
+
+
 def render_todo_tab():
+    render_option_manager()
+
     st.subheader("新增 / 編輯代辦事項")
 
     editing = None
@@ -73,12 +90,18 @@ def render_todo_tab():
             "地點（例如：B1停車場、3樓東側）", value=editing["location"] if editing else ""
         )
 
-        work_item = _select_with_add("工項", "work_items", "work_item_select")
-        type_ = _select_with_add("類型", "types", "type_select")
+        work_item = _select_with_add("工項", "work_item", "work_item_select")
+        type_ = _select_with_add("類型", "type", "type_select")
 
-        image_file = st.file_uploader("匯入圖說（選填）", type=["png", "jpg", "jpeg"])
+        if editing and editing.get("image_url"):
+            st.image(editing["image_url"], caption="目前的圖說", width=250)
+            st.caption("如果不重新上傳，會保留這張圖")
+
+        image_file = st.file_uploader(
+            "匯入圖說（選填，上傳新圖片會取代舊的）", type=["png", "jpg", "jpeg"]
+        )
         if image_file:
-            st.image(image_file, caption="預覽", width=250)
+            st.image(image_file, caption="新圖片預覽", width=250)
 
         col_a, col_b = st.columns(2)
         submit_label = "更新事項" if editing else "新增事項"
@@ -99,20 +122,29 @@ def render_todo_tab():
         elif not work_item or not type_:
             st.error("請完整選擇工項與類型")
         else:
+            image_url = None
+            if image_file is not None:
+                with st.spinner("圖片上傳中..."):
+                    image_url = data_store.upload_image(
+                        image_file.getvalue(), image_file.name, image_file.type
+                    )
+
             if editing:
-                data_store.update_todo(
-                    editing["id"],
+                fields = dict(
                     start_date=str(start_date), end_date=str(end_date),
                     task=task, location=location,
                     work_item=work_item, type=type_,
                     last_reminder_at="",  # 內容更新後重新起算提醒週期
                 )
+                if image_url is not None:
+                    fields["image_url"] = image_url
+                data_store.update_todo(editing["id"], **fields)
                 st.session_state.editing_id = None
                 st.success("已更新事項")
             else:
                 data_store.add_todo(
                     str(start_date), str(end_date), task, location,
-                    work_item, type_,
+                    work_item, type_, image_url=image_url or "",
                 )
                 st.success("已新增事項")
             st.rerun()
@@ -148,6 +180,8 @@ def render_todo_tab():
             if t.get("location"):
                 st.write(f"**地點：** {t['location']}")
             st.write(f"**目前分級：** {label}")
+            if t.get("image_url"):
+                st.image(t["image_url"], caption="圖說", width=300)
 
             c1, c2, c3 = st.columns(3)
             if c1.button("標記完成" if not completed else "取消完成", key=f"done_{t['id']}"):
