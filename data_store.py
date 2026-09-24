@@ -112,44 +112,46 @@ def _open_spreadsheet():
     return gc.open_by_key(_get_sheet_id())
 
 
-def _get_imgur_client_id():
+def _get_imgbb_api_key():
     try:
         import streamlit as st
-        if "IMGUR_CLIENT_ID" in st.secrets:
-            return st.secrets["IMGUR_CLIENT_ID"]
+        if "IMGBB_API_KEY" in st.secrets:
+            return st.secrets["IMGBB_API_KEY"]
     except Exception:
         pass
-    return os.environ.get("IMGUR_CLIENT_ID")
+    return os.environ.get("IMGBB_API_KEY")
 
 
 def upload_image(file_bytes, filename, mime_type):
     """
-    把圖片上傳到 Imgur（匿名上傳，不需要任何人登入），回傳一個可以直接用
-    st.image() 顯示的永久網址。
+    把圖片上傳到 ImgBB（免費圖片託管服務，不需要任何人登入或 OAuth），
+    回傳一個可以直接用 st.image() 顯示的網址。
 
-    改用 Imgur 而不是 Google Drive，是因為 Google 服務帳號本身沒有 Drive
-    儲存空間（容量是 0），一般 Gmail 帳號又沒有「共用雲端硬碟」這個功能可以
-    繞過這個限制（那是 Google Workspace 才有的付費功能），所以服務帳號
-    上傳檔案到 Drive 這條路走不通，改用不需要 OAuth 的 Imgur 匿名上傳 API。
+    之前試過 Google Drive（服務帳號沒有儲存空間，一般 Gmail 帳號又沒有
+    「共用雲端硬碟」可以繞過）、Imgur（部分地區存取受限），改用 ImgBB
+    是目前最簡單穩定的免費方案。
     """
-    client_id = _get_imgur_client_id()
-    if not client_id:
+    api_key = _get_imgbb_api_key()
+    if not api_key:
         raise RuntimeError(
-            "找不到 IMGUR_CLIENT_ID。請先到 https://api.imgur.com/oauth2/addclient "
-            "申請一組匿名上傳用的 Client ID，再設進 secrets 的 IMGUR_CLIENT_ID。"
+            "找不到 IMGBB_API_KEY。請先到 https://api.imgbb.com/ 免費申請一組 API Key，"
+            "再設進 secrets 的 IMGBB_API_KEY。"
         )
 
     resp = requests.post(
-        "https://api.imgur.com/3/image",
-        headers={"Authorization": f"Client-ID {client_id}"},
+        "https://api.imgbb.com/1/upload",
+        params={"key": api_key},
         files={"image": (filename, file_bytes, mime_type)},
         timeout=30,
     )
     if resp.status_code != 200:
-        raise RuntimeError(f"Imgur 上傳失敗 ({resp.status_code}): {resp.text}")
+        raise RuntimeError(f"ImgBB 上傳失敗 ({resp.status_code}): {resp.text}")
 
     data = resp.json()
-    return data["data"]["link"]
+    if not data.get("success"):
+        raise RuntimeError(f"ImgBB 上傳失敗：{data}")
+
+    return data["data"]["url"]
 
 
 def _get_or_create_worksheet(ss, title, headers, seed_rows=None):
