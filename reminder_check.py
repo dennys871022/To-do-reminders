@@ -109,11 +109,23 @@ def main():
         send_line_group_message_with_button(
             text, button_label="📋 開啟代辦系統", button_url=APP_URL
         )
-        for t in due:
-            data_store.mark_reminder_sent(t["id"], now_utc.isoformat())
-        print(f"已推播 1 則訊息（涵蓋 {len(due)} 筆事項）並更新提醒時間。")
     except Exception as e:
-        print(f"推播失敗：{e}")
+        # 真的沒發出去，這時候不標記，下次會正常重試，沒問題
+        print(f"推播失敗，LINE 訊息沒有送出：{e}")
+        return
+
+    # 訊息已經確定送出去了！接下來標記「已提醒過」，這步失敗也不能算「推播失敗」，
+    # 因為訊息真的已經發到群組了；只是這筆事項下次執行時可能會被誤判成「還沒提醒過」
+    # 而重複發送一次，所以印出明確的警告方便之後追蹤。
+    print(f"已推播 1 則訊息（涵蓋 {len(due)} 筆事項）。")
+    for t in due:
+        try:
+            data_store.mark_reminder_sent(t["id"], now_utc.isoformat())
+        except Exception as e:
+            print(
+                f"⚠️ 警告：id={t['id']} 的提醒訊息已送出，"
+                f"但更新「上次提醒時間」失敗（{e}），下次執行有機率重複提醒這筆。"
+            )
 
 
 if __name__ == "__main__":
