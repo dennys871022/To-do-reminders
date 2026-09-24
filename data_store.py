@@ -89,6 +89,20 @@ def _cache_resource(ttl=None):
         return _noop
 
 
+def _cache_data(ttl=15):
+    """在 Streamlit 環境下用 st.cache_data 包裝讀取函式，短時間內（預設15秒）
+    重複呼叫直接吃快取結果，不重打 Google API，避免觸發頻率限制。
+    寫入操作後會手動呼叫對應函式的 .clear() 讓畫面立刻反映最新資料，不用等快取過期。"""
+    try:
+        import streamlit as st
+        return st.cache_data(ttl=ttl)
+    except Exception:
+        def _noop(func):
+            func.clear = lambda: None
+            return func
+        return _noop
+
+
 @_cache_resource()
 def _client():
     creds = _get_credentials()
@@ -149,12 +163,13 @@ def upload_image(file_bytes, filename, mime_type):
     return f"https://drive.google.com/thumbnail?id={file_id}&sz=w1000"
 
 
-def _get_or_create_worksheet(ss, title, headers):
+def _get_or_create_worksheet(ss, title, headers, seed_rows=None):
     try:
         ws = ss.worksheet(title)
     except gspread.exceptions.WorksheetNotFound:
-        ws = ss.add_worksheet(title=title, rows=1000, cols=len(headers))
-        ws.append_row(headers)
+        ws = ss.add_worksheet(title=title, rows=1000, cols=max(len(headers), 2))
+        rows_to_write = [headers] + (seed_rows or [])
+        ws.append_rows(rows_to_write)
         return ws
 
     existing = ws.row_values(1)
@@ -186,6 +201,7 @@ def _row_to_dict(headers, row):
 
 # ---------------- 代辦事項 ----------------
 
+@_cache_data()
 def get_todos():
     ws = _todo_ws()
     records = ws.get_all_records(expected_headers=TODO_HEADERS)
@@ -210,6 +226,7 @@ def add_todo(start_date, end_date, task, location, work_item, type_, image_url="
         "image_url": image_url,
     }
     ws.append_row([row[h] for h in TODO_HEADERS])
+    get_todos.clear()
     return row
 
 
@@ -230,6 +247,7 @@ def update_todo(todo_id, **fields):
     current = _row_to_dict(TODO_HEADERS, row_values)
     current.update(fields)
     ws.update(f"A{idx}", [[current[h] for h in TODO_HEADERS]])
+    get_todos.clear()
 
 
 def delete_todo(todo_id):
@@ -237,6 +255,7 @@ def delete_todo(todo_id):
     idx = _find_row_index(ws, TODO_HEADERS, todo_id)
     if idx:
         ws.delete_rows(idx)
+    get_todos.clear()
 
 
 def mark_completed(todo_id, completed=True):
@@ -249,6 +268,7 @@ def mark_reminder_sent(todo_id, when_iso=None):
 
 # ---------------- 經驗分享 ----------------
 
+@_cache_data()
 def get_experiences():
     ws = _exp_ws()
     return ws.get_all_records(expected_headers=EXP_HEADERS)
@@ -265,6 +285,7 @@ def add_experience(work_item, details, mistakes, source="我的經驗"):
         "created_at": _now_iso(),
     }
     ws.append_row([row[h] for h in EXP_HEADERS])
+    get_experiences.clear()
     return row
 
 
@@ -273,23 +294,23 @@ def delete_experience(exp_id):
     idx = _find_row_index(ws, EXP_HEADERS, exp_id)
     if idx:
         ws.delete_rows(idx)
+    get_experiences.clear()
 
 
 # ---------------- 選單選項（工項／類型） ----------------
 
 def _option_ws():
-    ws = _get_or_create_worksheet(_open_spreadsheet(), "Options", OPTION_HEADERS)
-    # 第一次使用、表是空的時候，塞入預設選項
-    if len(ws.get_all_values()) <= 1:
-        rows = []
-        for category, values in DEFAULT_OPTIONS.items():
-            for v in values:
-                rows.append([category, v])
-        if rows:
-            ws.append_rows(rows)
-    return ws
+    seed_rows = [
+        [category, v]
+        for category, values in DEFAULT_OPTIONS.items()
+        for v in values
+    ]
+    return _get_or_create_worksheet(
+        _open_spreadsheet(), "Options", OPTION_HEADERS, seed_rows=seed_rows
+    )
 
 
+@_cache_data()
 def get_options(category):
     ws = _option_ws()
     records = ws.get_all_records(expected_headers=OPTION_HEADERS)
@@ -304,6 +325,7 @@ def add_option(category, value):
         return
     ws = _option_ws()
     ws.append_row([category, value])
+    get_options.clear()
 
 
 def delete_option(category, value):
@@ -312,4 +334,5 @@ def delete_option(category, value):
     for i, r in enumerate(records, start=2):  # 第 1 列是標題，資料從第 2 列開始
         if r["category"] == category and r["value"] == value:
             ws.delete_rows(i)
-            return
+            break
+    get_options.clear()
