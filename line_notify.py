@@ -13,6 +13,8 @@ import os
 import requests
 
 LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
+LINE_QUOTA_URL = "https://api.line.me/v2/bot/message/quota"
+LINE_QUOTA_CONSUMPTION_URL = "https://api.line.me/v2/bot/message/quota/consumption"
 
 
 def _get_secret(name):
@@ -95,3 +97,41 @@ def build_reminder_text(todo):
         f"工項：{todo['work_item']}／類型：{todo['type']}{loc}\n"
         f"期限：{date_range}"
     )
+
+
+def get_quota_status(channel_access_token=None):
+    """
+    查詢這個 LINE 官方帳號本月的訊息額度與已使用量。
+    回傳 {"limit": 額度上限(None代表沒有上限或查不到), "used": 本月已用則數}。
+    任何一步查詢失敗都不會丟例外，缺的欄位用 None 表示，方便畫面上優雅地顯示「暫時無法取得」。
+    """
+    token = channel_access_token or _get_secret("LINE_CHANNEL_ACCESS_TOKEN")
+    if not token:
+        return {"limit": None, "used": None, "error": "尚未設定 LINE_CHANNEL_ACCESS_TOKEN"}
+
+    headers = {"Authorization": f"Bearer {token}"}
+    limit, used, error = None, None, None
+
+    try:
+        resp = requests.get(LINE_QUOTA_URL, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            # type 為 "limited" 才有 value（月額度上限）；"none" 代表沒有上限（付費方案）
+            if data.get("type") == "limited":
+                limit = data.get("value")
+        else:
+            error = f"quota 查詢失敗 ({resp.status_code})"
+    except Exception as e:
+        error = f"quota 查詢發生錯誤：{e}"
+
+    try:
+        resp = requests.get(LINE_QUOTA_CONSUMPTION_URL, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            used = resp.json().get("totalUsage")
+        elif not error:
+            error = f"用量查詢失敗 ({resp.status_code})"
+    except Exception as e:
+        if not error:
+            error = f"用量查詢發生錯誤：{e}"
+
+    return {"limit": limit, "used": used, "error": error}
