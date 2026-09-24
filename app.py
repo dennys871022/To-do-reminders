@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 
 import data_store
 import urgency
+import line_notify
 
 st.set_page_config(page_title="營造管理系統", page_icon="🏗️", layout="wide")
 
@@ -248,9 +249,42 @@ def datetime_now_taipei_date():
     return _dt.datetime.now(TZ).date()
 
 
+@st.cache_data(ttl=600)  # 10 分鐘內不重複查詢，LINE 用量沒必要每次都即時打 API
+def _cached_line_quota():
+    return line_notify.get_quota_status()
+
+
+def render_line_quota_sidebar():
+    st.sidebar.subheader("📊 LINE 本月推播用量")
+    status = _cached_line_quota()
+
+    if status.get("error") and status.get("used") is None:
+        st.sidebar.caption(f"暫時無法取得用量資訊（{status['error']}）")
+        return
+
+    used = status.get("used")
+    limit = status.get("limit")
+
+    if used is None:
+        st.sidebar.caption("暫時無法取得用量資訊")
+        return
+
+    if limit:
+        st.sidebar.metric("已使用", f"{used} / {limit} 則")
+        st.sidebar.progress(min(used / limit, 1.0))
+    else:
+        st.sidebar.metric("已使用", f"{used} 則")
+        st.sidebar.caption("目前方案沒有月額度上限")
+
+    if st.sidebar.button("🔄 重新整理用量"):
+        _cached_line_quota.clear()
+        st.rerun()
+
+
 def main():
     _init_state()
     st.title("🏗️ 營造管理系統")
+    render_line_quota_sidebar()
 
     tab1, tab2 = st.tabs(["📋 代辦事項", "📚 經驗分享區"])
     with tab1:
