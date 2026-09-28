@@ -1,15 +1,23 @@
 """
 reminder_check.py
 -------------------
-分級規則現在統一由 urgency.py 提供，跟 app.py 共用同一套邏輯，兩邊不會兜不起來。
+【這版改版重點：不怕 GitHub 排程延遲】
+舊版只在「執行當下剛好落在提醒時段前後 20 分鐘內」才發送，但 GitHub Actions 的
+定時觸發常常延遲（實測過差一小時以上），一延遲就整個錯過、什麼都沒發。
 
-這支腳本必須搭配 GitHub Actions 在「台灣時間 08:00 / 13:30 / 17:00」各觸發一次
-（見 .github/workflows/reminder.yml，共 3 條 cron）。每次執行時會用「現在的
-台灣時間」去比對，只有真正命中該時段的事項才會被收進本次提醒；同一次執行如果
-有多筆事項到期，會合併成一則 LINE 訊息（附開啟 App 按鈕）發送，節省每月用量。
+新版改成「補發」邏輯：
+- 每個分級有固定的提醒時段（台灣時間）：
+    非常緊急：08:00 / 13:30 / 17:00　緊急：每天 08:00　一般：每 3 天 08:00
+- 每次執行時，找出「今天已經過了的最近一個時段」，如果這個時段還沒提醒過
+  （上次提醒時間比該時段早），而且離該時段不超過 4 小時，就補發一次。
+- 所以排程可以安排得比較密（見 reminder.yml），不管哪一次先跑到、跑得多晚，
+  每個時段都只會發一次，不會漏、也不會重複。
+
+分級規則由 urgency.py 提供（依結束日期自動判定）。
+同一次執行如果有多筆事項到期，合併成一則 LINE 訊息（附開啟 App 按鈕）。
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import data_store
@@ -18,13 +26,10 @@ from line_notify import send_line_group_message_with_button
 
 TZ = ZoneInfo("Asia/Taipei")
 
-# 判斷「現在」是否命中某個時段，允許正負 20 分鐘 的誤差
-# （GitHub Actions 的 schedule 觸發本來就不保證準時，尖峰時段延遲 15~30 分鐘很常見，
-#  容許範圍抓寬一點，避免延遲導致整個錯過時段而漏發）
-SLOT_TOLERANCE_MINUTES = 20
+# 錯過提醒時段後，最晚還願意補發到幾小時內（超過就不補，避免半夜才收到早上的提醒）
+MAX_LATE_HOURS = 4
 
 # 你的 Streamlit App 網址，按鈕點下去會開啟這裡
-# ⚠️ 請確認這個網址是不是你目前實際部署的網址，如果不是請改成正確的
 APP_URL = "https://to-do-reminders-kcltnn6fycdrcr2pd5t4rh.streamlit.app/"
 
 
@@ -32,31 +37,52 @@ def _is_completed(todo):
     return str(todo.get("completed", "")).strip().upper() == "TRUE"
 
 
-def _matches_current_slot(now_local, slots):
-    now_minutes = now_local.hour * 60 + now_local.minute
-    for h, m in slots:
-        target_minutes = h * 60 + m
-        if abs(now_minutes - target_minutes) <= SLOT_TOLERANCE_MINUTES:
-            return True
-    return False
-
-
-def _days_since(last_iso, now_utc):
-    if not last_iso:
+def _parse_iso(value):
+    if not value:
         return None
     try:
-        last = datetime.fromisoformat(last_iso)
+        dt = datetime.fromisoformat(value)
     except ValueError:
         return None
-    return (now_utc - last).total_seconds() / 86400
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _latest_slot(now_local, slots):
+    """今天已經過了的、最近的一個提醒時段；還沒到任何時段則回傳 None。"""
+    passed = []
+    for h, m in slots:
+        s = now_local.replace(hour=h, minute=m, second=0, microsecond=0)
+        if s <= now_local:
+            passed.append(s)
+    return max(passed) if passed else None
+
+
+def _is_due(todo, tier, now_local):
+    slot = _latest_slot(now_local, urgency.TIER_SLOTS[tier])
+    if slot is None:
+        return False
+    if now_local - slot > timedelta(hours=MAX_LATE_HOURS):
+        return False
+
+    last = _parse_iso(todo.get("last_reminder_at"))
+    if last is None:
+        return True  # 從來沒提醒過
+    last_local = last.astimezone(TZ)
+
+    if tier == "一般":
+        # 每 3 天提醒一次
+        return (now_local.date() - last_local.date()).days >= 3
+    # 非常緊急 / 緊急：這個時段還沒提醒過才發
+    return last_local < slot
 
 
 def _build_batch_text(items_by_tier):
     total = sum(len(v) for v in items_by_tier.values())
     lines = [f"【代辦提醒】共 {total} 筆事項需要注意\n"]
     for tier in urgency.TIER_ORDER:
-        items = items_by_tier.get(tier, [])
-        for t in items:
+        for t in items_by_tier.get(tier, []):
             loc = f"／{t.get('location')}" if t.get("location") else ""
             date_range = t["start_date"]
             if t["start_date"] != t["end_date"]:
@@ -69,34 +95,36 @@ def _build_batch_text(items_by_tier):
 
 
 def main():
-    now_utc = datetime.now(ZoneInfo("UTC"))
+    now_utc = datetime.now(timezone.utc)
     now_local = now_utc.astimezone(TZ)
     today = now_local.date()
+    print(f"[執行時間] 台灣時間 {now_local:%Y-%m-%d %H:%M}")
 
     todos = data_store.get_todos()
+    print(f"[資料] 共讀到 {len(todos)} 筆代辦事項")
 
     due = []
+    skipped_summary = {"已完成": 0, "超過30天尚未進入提醒範圍": 0, "這個時段已提醒過或不在補發時間內": 0}
     for t in todos:
         if _is_completed(t):
+            skipped_summary["已完成"] += 1
             continue
 
         tier = urgency.classify_tier(t.get("end_date"), today)
         if tier is None:
+            skipped_summary["超過30天尚未進入提醒範圍"] += 1
             continue
 
-        if not _matches_current_slot(now_local, urgency.TIER_SLOTS[tier]):
+        if not _is_due(t, tier, now_local):
+            skipped_summary["這個時段已提醒過或不在補發時間內"] += 1
             continue
-
-        if tier == "一般":
-            days_since = _days_since(t.get("last_reminder_at"), now_utc)
-            if days_since is not None and days_since < 3:
-                continue
 
         t["_tier"] = tier
         due.append(t)
 
+    print(f"[判斷結果] 需提醒 {len(due)} 筆；略過：{skipped_summary}")
     if not due:
-        print(f"[{now_local:%Y-%m-%d %H:%M} 台灣時間] 目前沒有命中提醒時段的事項。")
+        print("目前沒有需要提醒的事項。")
         return
 
     items_by_tier = {}
@@ -110,13 +138,10 @@ def main():
             text, button_label="📋 開啟代辦系統", button_url=APP_URL
         )
     except Exception as e:
-        # 真的沒發出去，這時候不標記，下次會正常重試，沒問題
+        # 真的沒發出去，不標記，下次執行會自動重試
         print(f"推播失敗，LINE 訊息沒有送出：{e}")
-        return
+        raise SystemExit(1)  # 讓 workflow 顯示紅色失敗，才不會又默默綠勾勾
 
-    # 訊息已經確定送出去了！接下來標記「已提醒過」，這步失敗也不能算「推播失敗」，
-    # 因為訊息真的已經發到群組了；只是這筆事項下次執行時可能會被誤判成「還沒提醒過」
-    # 而重複發送一次，所以印出明確的警告方便之後追蹤。
     print(f"已推播 1 則訊息（涵蓋 {len(due)} 筆事項）。")
     for t in due:
         try:
