@@ -2,17 +2,22 @@ name: LINE 代辦提醒排程
 
 on:
   schedule:
-    # 台灣時間 08:00 = UTC 00:00
-    - cron: "0 0 * * *"
-    # 台灣時間 13:30 = UTC 05:30
-    - cron: "30 5 * * *"
-    # 台灣時間 17:00 = UTC 09:00
-    - cron: "0 9 * * *"
+    # 台灣時間 08:17 ~ 18:47 之間，每 30 分鐘檢查一次（UTC 00:17 ~ 10:47）。
+    # 故意避開整點（:00），因為 GitHub 整點時段最擁擠、延遲最嚴重。
+    # 提醒程式本身有「這個時段已提醒過就不重發」的保護，所以密集檢查不會造成重複推播；
+    # 就算其中幾次被 GitHub 延遲或跳過，後面的檢查也會自動補發。
+    - cron: "17,47 0-10 * * *"
   workflow_dispatch: {}   # 允許在 GitHub 網頁上手動觸發，方便測試
+
+# 避免兩次執行同時進行（可能造成重複推播）
+concurrency:
+  group: line-reminder
+  cancel-in-progress: false
 
 jobs:
   check-reminders:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: 取出程式碼
         uses: actions/checkout@v4
@@ -21,6 +26,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
 
       - name: 安裝套件
         run: pip install -r requirements.txt
