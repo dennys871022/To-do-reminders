@@ -135,3 +135,27 @@ def get_quota_status(channel_access_token=None):
             error = f"用量查詢發生錯誤：{e}"
 
     return {"limit": limit, "used": used, "error": error}
+
+
+def get_group_member_count(group_id=None, channel_access_token=None, default=9):
+    """
+    查詢群組人數（用來估算一次推播會扣多少則額度：每次推播 × 群組人數）。
+    查詢失敗時回傳預設值 default，不會丟例外。
+    """
+    token = channel_access_token or _get_secret("LINE_CHANNEL_ACCESS_TOKEN")
+    group = group_id or _get_secret("LINE_GROUP_ID")
+    if not token or not group:
+        return default
+    try:
+        resp = requests.get(
+            f"https://api.line.me/v2/bot/group/{group}/members/count",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            count = resp.json().get("count")
+            if isinstance(count, int) and count > 0:
+                return count
+    except Exception:
+        pass
+    return default
