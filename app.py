@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 
 import data_store
 import urgency
+import discord_notify
 
 st.set_page_config(page_title="營造管理系統", page_icon="🏗️", layout="wide")
 
@@ -38,39 +39,60 @@ def _select_with_add(label, category, key):
 
 
 def render_option_manager():
-    """管理工項／類型選項：新增、刪除都在這裡做（表單外，才能即時刷新）。"""
-    with st.expander("⚙️ 管理工項／類型選單", expanded=False):
-        col1, col2 = st.columns(2)
+    """管理工項／類型／工程師／移工選項：新增、刪除都在這裡做（表單外，才能即時刷新）。"""
+    with st.expander("⚙️ 管理選單（工項／類型／工程師／移工）", expanded=False):
+        _render_option_column("work_item", "工項")
+        _render_option_column("type", "類型")
+        _render_option_column("engineer", "工程師（指派人）")
+        _render_option_column("worker", "移工")
 
-        with col1:
-            st.markdown("**工項**")
-            for v in data_store.get_options("work_item"):
-                c1, c2 = st.columns([4, 1])
-                c1.write(v)
-                if c2.button("🗑", key=f"del_work_item_{v}"):
-                    data_store.delete_option("work_item", v)
-                    st.rerun()
-            with st.form("add_work_item_form", clear_on_submit=True):
-                new_work_item = st.text_input("新增工項", key="new_work_item_input")
-                if st.form_submit_button("新增"):
-                    if new_work_item.strip():
-                        data_store.add_option("work_item", new_work_item.strip())
-                        st.rerun()
 
-        with col2:
-            st.markdown("**類型**")
-            for v in data_store.get_options("type"):
-                c1, c2 = st.columns([4, 1])
-                c1.write(v)
-                if c2.button("🗑", key=f"del_type_{v}"):
-                    data_store.delete_option("type", v)
-                    st.rerun()
-            with st.form("add_type_form", clear_on_submit=True):
-                new_type = st.text_input("新增類型", key="new_type_input")
-                if st.form_submit_button("新增"):
-                    if new_type.strip():
-                        data_store.add_option("type", new_type.strip())
-                        st.rerun()
+def _render_option_column(category, label):
+    st.markdown(f"**{label}**")
+    for v in data_store.get_options(category):
+        c1, c2 = st.columns([5, 1])
+        c1.write(v)
+        if c2.button("🗑", key=f"del_{category}_{v}"):
+            data_store.delete_option(category, v)
+            st.rerun()
+    with st.form(f"add_{category}_form", clear_on_submit=True):
+        c1, c2 = st.columns([4, 1])
+        new_val = c1.text_input(f"新增{label}", key=f"new_{category}_input", label_visibility="collapsed", placeholder=f"新增{label}")
+        if c2.form_submit_button("新增"):
+            if new_val.strip():
+                data_store.add_option(category, new_val.strip())
+                st.rerun()
+    st.divider()
+
+
+def _notify_discord_instant(todo, action):
+    """新增或編輯代辦事項後，立即發一則 Discord 通知（跟排程的每日彙整是獨立的兩條路）。
+    推播失敗只顯示小提醒，不會影響代辦事項本身已經存檔成功這件事。"""
+    try:
+        today = datetime_now_taipei_date()
+        tier = urgency.classify_tier(todo.get("end_date"), today) or "一般"
+        icon = "🆕" if action == "新增" else "✏️"
+
+        date_range = todo["start_date"]
+        if todo["start_date"] != todo["end_date"]:
+            date_range += f"~{todo['end_date']}"
+
+        lines = [
+            f"{icon} **{action}代辦事項** ［{tier}］",
+            f"{todo['task']}",
+            f"工項：{todo['work_item']}／類型：{todo['type']}",
+        ]
+        if todo.get("location"):
+            lines.append(f"地點：{todo['location']}")
+        lines.append(f"期限：{date_range}")
+        if todo.get("engineer"):
+            lines.append(f"指派人：{todo['engineer']}")
+        if todo.get("workers"):
+            lines.append(f"移工：{todo['workers']}")
+
+        discord_notify.send_discord_message("\n".join(lines))
+    except Exception as e:
+        st.warning(f"代辦事項已儲存，但即時通知發送失敗（{e}），不影響資料，排程提醒仍會照常運作。")
 
 
 def render_todo_tab():
@@ -103,6 +125,17 @@ def render_todo_tab():
 
         work_item = _select_with_add("工項", "work_item", "work_item_select")
         type_ = _select_with_add("類型", "type", "type_select")
+
+        engineer = _select_with_add("指派人（工程師）", "engineer", "engineer_select")
+
+        worker_options = data_store.get_options("worker")
+        default_workers = data_store.split_workers(editing["workers"]) if editing else []
+        default_workers = [w for w in default_workers if w in worker_options]
+        workers_selected = st.multiselect(
+            "移工名單（可複選）", worker_options, default=default_workers, key="workers_select"
+        )
+        if not worker_options:
+            st.warning("目前沒有移工選項，請先到上方「⚙️ 管理選單」新增。")
 
         if editing and editing.get("image_url"):
             st.image(editing["image_url"], caption="目前的圖說", width=250)
@@ -140,11 +173,15 @@ def render_todo_tab():
                         image_file.getvalue(), image_file.name, image_file.type
                     )
 
+            workers_str = data_store.join_workers(workers_selected)
+            action = "更新" if editing else "新增"
+
             if editing:
                 fields = dict(
                     start_date=str(start_date), end_date=str(end_date),
                     task=task, location=location,
                     work_item=work_item, type=type_,
+                    engineer=engineer, workers=workers_str,
                     last_reminder_at="",  # 內容更新後重新起算提醒週期
                 )
                 if image_url is not None:
@@ -152,12 +189,16 @@ def render_todo_tab():
                 data_store.update_todo(editing["id"], **fields)
                 st.session_state.editing_id = None
                 st.success("已更新事項")
+                saved_todo = {**editing, **fields}
             else:
-                data_store.add_todo(
+                saved_todo = data_store.add_todo(
                     str(start_date), str(end_date), task, location,
                     work_item, type_, image_url=image_url or "",
+                    engineer=engineer, workers=workers_str,
                 )
                 st.success("已新增事項")
+
+            _notify_discord_instant(saved_todo, action)
             st.rerun()
 
     st.divider()
@@ -190,6 +231,10 @@ def render_todo_tab():
             st.write(f"**工項／類型：** {t['work_item']} ／ {t['type']}")
             if t.get("location"):
                 st.write(f"**地點：** {t['location']}")
+            if t.get("engineer"):
+                st.write(f"**指派人：** {t['engineer']}")
+            if t.get("workers"):
+                st.write(f"**移工：** {t['workers']}")
             st.write(f"**目前分級：** {label}")
             if t.get("image_url"):
                 st.image(t["image_url"], caption="圖說", width=300)
