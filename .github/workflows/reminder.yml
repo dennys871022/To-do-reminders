@@ -1,22 +1,22 @@
-name: LINE 代辦提醒排程
+name: Discord 代辦提醒排程
 
 on:
   schedule:
-    # 台灣時間 08:17 ~ 13:47 之間，每 30 分鐘檢查一次（UTC 00:17 ~ 05:47）。
-    # 程式只在週一、三、五、日發送一則早上彙整，其餘時間只是檢查後直接結束，不會發訊息。
-    # 這麼密集是因為 GitHub 定時觸發常延遲數小時，多檢查幾次才確保當天一定補得上；
-    # 程式有「今天已發過就不重發」的保護，不會重複推播。
-    - cron: "17,47 0-5 * * *"
+    # 台灣時間 08:17 ~ 18:47 之間，每 30 分鐘檢查一次（UTC 00:17 ~ 10:47）。
+    # 故意避開整點，因為 GitHub 整點最擁擠、延遲最嚴重。
+    # 程式有「這個時段已提醒過就不重發」的保護，密集檢查不會造成重複推播；
+    # 就算 GitHub 延遲或跳過其中幾次，後面的檢查也會自動補發。
+    - cron: "17,47 0-10 * * *"
   workflow_dispatch:
     inputs:
       force:
-        description: "測試用：勾選後忽略發送日與時間，立刻發送一則到群組（會扣一次額度，不影響正式排程）"
+        description: "測試用：勾選後忽略提醒時段，立刻把所有未完成事項發到頻道（不影響正式排程）"
         type: boolean
         default: false
 
 # 避免兩次執行同時進行（可能造成重複推播）
 concurrency:
-  group: line-reminder
+  group: discord-reminder
   cancel-in-progress: false
 
 jobs:
@@ -40,7 +40,6 @@ jobs:
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
-          LINE_GROUP_ID: ${{ secrets.LINE_GROUP_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           FORCE_SEND: ${{ inputs.force }}
         run: python reminder_check.py
