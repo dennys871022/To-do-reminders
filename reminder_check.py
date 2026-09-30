@@ -34,7 +34,7 @@ TZ = ZoneInfo("Asia/Taipei")
 MAX_LATE_HOURS = 6
 
 # 安靜時段（台灣時間）：這段時間不發送
-QUIET_START_HOUR = 21
+QUIET_START_HOUR = 19
 QUIET_END_HOUR = 7
 
 # 你的 Streamlit App 網址，附在訊息下方
