@@ -29,15 +29,35 @@ SCOPES = [
 TODO_HEADERS = [
     "id", "start_date", "end_date", "task", "location", "urgency",
     "work_item", "type", "completed", "created_at", "last_reminder_at",
-    "image_url",
+    "image_url", "engineer", "workers",
 ]
 EXP_HEADERS = ["id", "work_item", "source", "details", "mistakes", "created_at"]
 OPTION_HEADERS = ["category", "value"]
 
+# 移工名單用「、」分隔存在 workers 欄位裡（一筆代辦可能同時指派多位移工）
+WORKERS_SEPARATOR = "、"
+
 DEFAULT_OPTIONS = {
     "work_item": ["泥作", "木作", "水電", "連續壁"],
     "type": ["叫料", "派工", "查驗"],
+    "engineer": ["林智捷", "孫永明", "黃元杰"],
+    "worker": [
+        "15020 黎文海", "15028 李文藥", "15030 阮進康", "15033 阮江南",
+        "15034 阮英俊", "15038 高德", "15048 阮文財", "15049 馮孫昭",
+        "9015 楊文豐", "FY-19 阮文情",
+    ],
 }
+
+
+def split_workers(workers_str):
+    """把儲存格裡用「、」分隔的移工字串拆回清單，方便畫面上用 multiselect 顯示。"""
+    if not workers_str:
+        return []
+    return [w.strip() for w in workers_str.split(WORKERS_SEPARATOR) if w.strip()]
+
+
+def join_workers(workers_list):
+    return WORKERS_SEPARATOR.join(workers_list)
 
 
 def _get_credentials():
@@ -199,8 +219,10 @@ def get_todos():
     return records
 
 
-def add_todo(start_date, end_date, task, location, work_item, type_, image_url=""):
-    """新增代辦事項。緊急程度不再由使用者傳入，一律由到期日自動判定。"""
+def add_todo(start_date, end_date, task, location, work_item, type_,
+             image_url="", engineer="", workers=""):
+    """新增代辦事項。緊急程度不再由使用者傳入，一律由到期日自動判定。
+    workers 傳入時請用 join_workers(list) 轉成字串再傳進來。"""
     ws = _todo_ws()
     row = {
         "id": _gen_id("todo"),
@@ -215,6 +237,8 @@ def add_todo(start_date, end_date, task, location, work_item, type_, image_url="
         "created_at": _now_iso(),
         "last_reminder_at": "",
         "image_url": image_url,
+        "engineer": engineer,
+        "workers": workers,
     }
     ws.append_row([row[h] for h in TODO_HEADERS])
     get_todos.clear()
