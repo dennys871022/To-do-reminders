@@ -10,6 +10,7 @@ app.py
 """
 
 import streamlit as st
+import pandas as pd
 from datetime import date
 from zoneinfo import ZoneInfo
 
@@ -251,6 +252,67 @@ def render_todo_tab():
                 st.rerun()
 
 
+def render_dispatch_tab():
+    st.subheader("📅 每日派工總表")
+
+    pick_date = st.date_input("選擇日期", value=datetime_now_taipei_date(), key="dispatch_date")
+    only_dispatched = st.checkbox("只顯示有指派移工的項目", value=True, key="dispatch_only_assigned")
+
+    todos = data_store.get_todos()
+
+    def _in_range(t):
+        try:
+            s = date.fromisoformat(t["start_date"])
+            e = date.fromisoformat(t["end_date"])
+        except (ValueError, TypeError):
+            return False
+        return s <= pick_date <= e
+
+    matched = [t for t in todos if _in_range(t)]
+    if only_dispatched:
+        matched = [t for t in matched if t.get("workers")]
+
+    if not matched:
+        st.info(f"{pick_date} 沒有符合條件的派工項目。")
+        return
+
+    today = datetime_now_taipei_date()
+
+    def _sort_key(t):
+        tier = urgency.classify_tier(t["end_date"], today)
+        return urgency.TIER_ORDER.index(tier) if tier in urgency.TIER_ORDER else len(urgency.TIER_ORDER)
+
+    matched.sort(key=_sort_key)
+
+    rows = []
+    total_workers = set()
+    for t in matched:
+        completed = str(t.get("completed", "")).strip().upper() == "TRUE"
+        tier = urgency.classify_tier(t["end_date"], today)
+        date_range = t["start_date"] if t["start_date"] == t["end_date"] else f"{t['start_date']}~{t['end_date']}"
+        workers_list = data_store.split_workers(t.get("workers", ""))
+        total_workers.update(workers_list)
+        rows.append({
+            "分級": urgency.TIER_ICONS.get(tier, "⚪") if tier else "⚪",
+            "指派人": t.get("engineer") or "－",
+            "事項說明": t["task"],
+            "工項": t["work_item"],
+            "類型": t["type"],
+            "地點": t.get("location") or "－",
+            "移工名單": t.get("workers") or "－",
+            "期限": date_range,
+            "狀態": "已完成" if completed else "進行中",
+        })
+
+    df = pd.DataFrame(rows)
+
+    c1, c2 = st.columns(2)
+    c1.metric("當天派工項目數", len(rows))
+    c2.metric("涉及移工人數", len(total_workers))
+
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+
 def render_experience_tab():
     st.subheader("新增經驗")
     with st.form("exp_form", clear_on_submit=True):
@@ -297,10 +359,12 @@ def main():
     _init_state()
     st.title("🏗️ 營造管理系統")
 
-    tab1, tab2 = st.tabs(["📋 代辦事項", "📚 經驗分享區"])
+    tab1, tab2, tab3 = st.tabs(["📋 代辦事項", "📅 派工總表", "📚 經驗分享區"])
     with tab1:
         render_todo_tab()
     with tab2:
+        render_dispatch_tab()
+    with tab3:
         render_experience_tab()
 
 
