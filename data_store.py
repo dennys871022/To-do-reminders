@@ -271,6 +271,8 @@ def delete_todo(todo_id):
     if idx:
         ws.delete_rows(idx)
     get_todos.clear()
+    for d in get_dispatches_for_todo(todo_id):
+        delete_dispatch(d["id"])
 
 
 def mark_completed(todo_id, completed=True):
@@ -351,3 +353,48 @@ def delete_option(category, value):
             ws.delete_rows(i)
             break
     get_options.clear()
+
+
+# ---------------- 派工紀錄（Dispatch） ----------------
+# 一筆代辦事項（Todo）可以有多筆派工紀錄，每筆派工紀錄有自己獨立的日期
+# （預設只有選定的那一天生效，隔天自動不算數，除非明確選一段區間），
+# 以及自己的移工名單。這樣同一個工項橫跨多天時，可以每天換不同的人。
+
+DISPATCH_HEADERS = ["id", "todo_id", "start_date", "end_date", "workers", "created_at"]
+
+
+def _dispatch_ws():
+    return _get_or_create_worksheet(_open_spreadsheet(), "Dispatches", DISPATCH_HEADERS)
+
+
+@_cache_data()
+def get_dispatches():
+    ws = _dispatch_ws()
+    return ws.get_all_records(expected_headers=DISPATCH_HEADERS)
+
+
+def get_dispatches_for_todo(todo_id):
+    return [d for d in get_dispatches() if d["todo_id"] == todo_id]
+
+
+def add_dispatch(todo_id, start_date, end_date, workers):
+    ws = _dispatch_ws()
+    row = {
+        "id": _gen_id("dispatch"),
+        "todo_id": todo_id,
+        "start_date": start_date,
+        "end_date": end_date,
+        "workers": workers,
+        "created_at": _now_iso(),
+    }
+    ws.append_row([row[h] for h in DISPATCH_HEADERS])
+    get_dispatches.clear()
+    return row
+
+
+def delete_dispatch(dispatch_id):
+    ws = _dispatch_ws()
+    idx = _find_row_index(ws, DISPATCH_HEADERS, dispatch_id)
+    if idx:
+        ws.delete_rows(idx)
+    get_dispatches.clear()
