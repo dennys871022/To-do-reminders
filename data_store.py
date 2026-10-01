@@ -189,10 +189,12 @@ def _get_or_create_worksheet(ss, title, headers, seed_rows=None):
     return ws
 
 
+@_cache_resource(ttl=300)
 def _todo_ws():
     return _get_or_create_worksheet(_open_spreadsheet(), "Todos", TODO_HEADERS)
 
 
+@_cache_resource(ttl=300)
 def _exp_ws():
     return _get_or_create_worksheet(_open_spreadsheet(), "Experiences", EXP_HEADERS)
 
@@ -316,6 +318,7 @@ def delete_experience(exp_id):
 
 # ---------------- 選單選項（工項／類型） ----------------
 
+@_cache_resource(ttl=300)
 def _option_ws():
     seed_rows = [
         [category, v]
@@ -363,6 +366,7 @@ def delete_option(category, value):
 DISPATCH_HEADERS = ["id", "todo_id", "start_date", "end_date", "workers", "created_at"]
 
 
+@_cache_resource(ttl=300)
 def _dispatch_ws():
     return _get_or_create_worksheet(_open_spreadsheet(), "Dispatches", DISPATCH_HEADERS)
 
