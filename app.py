@@ -240,8 +240,10 @@ def render_todo_tab():
     st.subheader("代辦事項清單")
 
     todos = data_store.get_todos()
-    if not todos:
-        st.info("目前沒有代辦事項。")
+    active_todos = [t for t in todos if str(t.get("completed", "")).strip().upper() != "TRUE"]
+
+    if not active_todos:
+        st.info("目前沒有進行中的代辦事項。已完成的事項可以到「📜 歷史記錄」分頁查詢。")
         return
 
     today = datetime_now_taipei_date()
@@ -253,13 +255,12 @@ def render_todo_tab():
             return urgency.TIER_ORDER.index(tier)
         return len(urgency.TIER_ORDER)
 
-    todos_sorted = sorted(todos, key=_sort_key)
+    todos_sorted = sorted(active_todos, key=_sort_key)
 
     for t in todos_sorted:
-        completed = str(t.get("completed", "")).strip().upper() == "TRUE"
         label = urgency.tier_label(t["end_date"], today)
         date_range = t["start_date"] if t["start_date"] == t["end_date"] else f"{t['start_date']} ~ {t['end_date']}"
-        title = f"{label} {'~~' if completed else ''}{t['task']}{'~~' if completed else ''}"
+        title = f"{label} {t['task']}"
 
         with st.expander(title):
             st.write(f"**期限：** {date_range}")
@@ -282,15 +283,12 @@ def render_todo_tab():
             if t.get("image_url"):
                 st.image(t["image_url"], caption="圖說", width=300)
 
-            c1, c2, c3 = st.columns(3)
-            if c1.button("標記完成" if not completed else "取消完成", key=f"done_{t['id']}"):
-                data_store.mark_completed(t["id"], not completed)
+            c1, c2 = st.columns(2)
+            if c1.button("標記完成", key=f"done_{t['id']}"):
+                data_store.mark_completed(t["id"], True)
                 st.rerun()
             if c2.button("編輯", key=f"edit_{t['id']}"):
                 st.session_state.editing_id = t["id"]
-                st.rerun()
-            if c3.button("刪除", key=f"del_{t['id']}"):
-                data_store.delete_todo(t["id"])
                 st.rerun()
 
 
@@ -472,6 +470,83 @@ def render_dispatch_tab():
             st.write(f"・{t['task']}（{t['work_item']}／{t.get('location') or '無地點'}）")
 
 
+def render_history_tab():
+    st.subheader("📜 歷史記錄查詢")
+    st.caption("這裡可以查到所有代辦事項，包含已完成、已不在主清單顯示的項目。")
+
+    todos = data_store.get_todos()
+    if not todos:
+        st.info("目前沒有任何代辦事項紀錄。")
+        return
+
+    c1, c2, c3 = st.columns(3)
+    keyword = c1.text_input("關鍵字搜尋（事項說明）", key="history_keyword")
+    status_filter = c2.selectbox("完成狀態", ["全部", "已完成", "進行中"], key="history_status")
+    work_item_options = ["全部"] + data_store.get_options("work_item")
+    work_item_filter = c3.selectbox("工項", work_item_options, key="history_work_item")
+
+    c4, c5 = st.columns(2)
+    date_from = c4.date_input("期限（結束日期）從", value=None, key="history_date_from")
+    date_to = c5.date_input("期限（結束日期）到", value=None, key="history_date_to")
+
+    filtered = todos
+    if keyword.strip():
+        filtered = [t for t in filtered if keyword.strip() in t.get("task", "")]
+    if status_filter == "已完成":
+        filtered = [t for t in filtered if str(t.get("completed", "")).strip().upper() == "TRUE"]
+    elif status_filter == "進行中":
+        filtered = [t for t in filtered if str(t.get("completed", "")).strip().upper() != "TRUE"]
+    if work_item_filter != "全部":
+        filtered = [t for t in filtered if t.get("work_item") == work_item_filter]
+    if date_from:
+        filtered = [t for t in filtered if _safe_date(t.get("end_date")) and _safe_date(t["end_date"]) >= date_from]
+    if date_to:
+        filtered = [t for t in filtered if _safe_date(t.get("end_date")) and _safe_date(t["end_date"]) <= date_to]
+
+    filtered = sorted(filtered, key=lambda t: t.get("end_date", ""), reverse=True)
+
+    st.caption(f"共找到 {len(filtered)} 筆")
+    if not filtered:
+        st.info("沒有符合條件的紀錄。")
+        return
+
+    rows = []
+    for t in filtered:
+        completed = str(t.get("completed", "")).strip().upper() == "TRUE"
+        date_range = t["start_date"] if t["start_date"] == t["end_date"] else f"{t['start_date']}~{t['end_date']}"
+        dispatches = data_store.get_dispatches_for_todo(t["id"])
+        workers_set = {w for d in dispatches for w in data_store.split_workers(d.get("workers", ""))}
+        rows.append({
+            "狀態": "✅已完成" if completed else "🔸進行中",
+            "事項說明": t["task"],
+            "工項": t["work_item"],
+            "類型": t["type"],
+            "地點": t.get("location") or "－",
+            "指派人": t.get("engineer") or "－",
+            "期限": date_range,
+            "曾派工移工": "、".join(sorted(workers_set)) if workers_set else "－",
+        })
+
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    with st.expander("✏️ 修正完成狀態（例如不小心標錯）"):
+        pick_labels = [f"{t['task']}（期限 {t['end_date']}，{'已完成' if str(t.get('completed','')).strip().upper()=='TRUE' else '進行中'}）" for t in filtered]
+        pick_idx = st.selectbox("選擇事項", range(len(filtered)), format_func=lambda i: pick_labels[i], key="history_toggle_select")
+        target = filtered[pick_idx]
+        target_completed = str(target.get("completed", "")).strip().upper() == "TRUE"
+        btn_label = "取消完成（改回進行中）" if target_completed else "標記為已完成"
+        if st.button(btn_label, key="history_toggle_btn"):
+            data_store.mark_completed(target["id"], not target_completed)
+            st.rerun()
+
+
+def _safe_date(value):
+    try:
+        return date.fromisoformat(value)
+    except (ValueError, TypeError):
+        return None
+
+
 def render_experience_tab():
     st.subheader("新增經驗")
     with st.form("exp_form", clear_on_submit=True):
@@ -518,7 +593,9 @@ def main():
     _init_state()
     st.title("🏗️ 營造管理系統")
 
-    tab1, tab2, tab3, tab4 = st.tabs(["📋 代辦事項", "👷 移工指派", "📅 派工總表", "📚 經驗分享區"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+        ["📋 代辦事項", "👷 移工指派", "📅 派工總表", "📜 歷史記錄", "📚 經驗分享區"]
+    )
     with tab1:
         render_todo_tab()
     with tab2:
@@ -526,6 +603,8 @@ def main():
     with tab3:
         render_dispatch_tab()
     with tab4:
+        render_history_tab()
+    with tab5:
         render_experience_tab()
 
 
