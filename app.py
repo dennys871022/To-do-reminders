@@ -88,12 +88,55 @@ def _notify_discord_instant(todo, action):
         lines.append(f"期限：{date_range}")
         if todo.get("engineer"):
             lines.append(f"指派人：{todo['engineer']}")
-        if todo.get("workers"):
-            lines.append(f"移工：{todo['workers']}")
 
         discord_notify.send_discord_message("\n".join(lines))
     except Exception as e:
         st.warning(f"代辦事項已儲存，但即時通知發送失敗（{e}），不影響資料，排程提醒仍會照常運作。")
+
+
+def _compute_busy_workers_dispatch(all_dispatches, start_date, end_date, exclude_id=None, completed_todo_ids=None):
+    """
+    算出在 [start_date, end_date] 這段期間，已經被排進「其他」派工紀錄的移工。
+    completed_todo_ids：所屬事項已標記完成的 todo_id 集合，這些派工紀錄不算佔用
+    （事項做完了，人就該空出來）。
+    回傳 {移工姓名: 佔用的那筆派工紀錄 dict}（取第一筆佔用的，方便顯示原因）。
+    """
+    completed_todo_ids = completed_todo_ids or set()
+    busy = {}
+    for d in all_dispatches:
+        if exclude_id and d["id"] == exclude_id:
+            continue
+        if d.get("todo_id") in completed_todo_ids:
+            continue
+        try:
+            ds = date.fromisoformat(d["start_date"])
+            de = date.fromisoformat(d["end_date"])
+        except (ValueError, TypeError):
+            continue
+        if ds <= end_date and de >= start_date:  # 期間重疊
+            for w in data_store.split_workers(d.get("workers", "")):
+                busy.setdefault(w, d)
+    return busy
+
+
+def _notify_discord_dispatch(todo, dispatch):
+    """新增派工紀錄後，立即發一則 Discord 通知。"""
+    try:
+        rng = dispatch["start_date"] if dispatch["start_date"] == dispatch["end_date"] else f"{dispatch['start_date']}~{dispatch['end_date']}"
+        lines = [
+            "👷 **新增派工**",
+            f"{todo['task']}",
+            f"工項：{todo['work_item']}／類型：{todo['type']}",
+        ]
+        if todo.get("location"):
+            lines.append(f"地點：{todo['location']}")
+        if todo.get("engineer"):
+            lines.append(f"指派人：{todo['engineer']}")
+        lines.append(f"派工日期：{rng}")
+        lines.append(f"移工：{dispatch['workers']}")
+        discord_notify.send_discord_message("\n".join(lines))
+    except Exception as e:
+        st.warning(f"派工已儲存，但即時通知發送失敗（{e}），不影響資料。")
 
 
 def render_todo_tab():
@@ -126,17 +169,9 @@ def render_todo_tab():
 
         work_item = _select_with_add("工項", "work_item", "work_item_select")
         type_ = _select_with_add("類型", "type", "type_select")
-
         engineer = _select_with_add("指派人（工程師）", "engineer", "engineer_select")
 
-        worker_options = data_store.get_options("worker")
-        default_workers = data_store.split_workers(editing["workers"]) if editing else []
-        default_workers = [w for w in default_workers if w in worker_options]
-        workers_selected = st.multiselect(
-            "移工名單（可複選）", worker_options, default=default_workers, key="workers_select"
-        )
-        if not worker_options:
-            st.warning("目前沒有移工選項，請先到上方「⚙️ 管理選單」新增。")
+        st.caption("💡 移工的每日派工，請到「👷 移工指派」分頁另外安排（同一個工項橫跨多天時，每天可以換不同的人）。")
 
         if editing and editing.get("image_url"):
             st.image(editing["image_url"], caption="目前的圖說", width=250)
@@ -174,7 +209,6 @@ def render_todo_tab():
                         image_file.getvalue(), image_file.name, image_file.type
                     )
 
-            workers_str = data_store.join_workers(workers_selected)
             action = "更新" if editing else "新增"
 
             if editing:
@@ -182,7 +216,7 @@ def render_todo_tab():
                     start_date=str(start_date), end_date=str(end_date),
                     task=task, location=location,
                     work_item=work_item, type=type_,
-                    engineer=engineer, workers=workers_str,
+                    engineer=engineer,
                     last_reminder_at="",  # 內容更新後重新起算提醒週期
                 )
                 if image_url is not None:
@@ -195,7 +229,7 @@ def render_todo_tab():
                 saved_todo = data_store.add_todo(
                     str(start_date), str(end_date), task, location,
                     work_item, type_, image_url=image_url or "",
-                    engineer=engineer, workers=workers_str,
+                    engineer=engineer,
                 )
                 st.success("已新增事項")
 
@@ -234,9 +268,17 @@ def render_todo_tab():
                 st.write(f"**地點：** {t['location']}")
             if t.get("engineer"):
                 st.write(f"**指派人：** {t['engineer']}")
-            if t.get("workers"):
-                st.write(f"**移工：** {t['workers']}")
             st.write(f"**目前分級：** {label}")
+
+            dispatches = sorted(data_store.get_dispatches_for_todo(t["id"]), key=lambda d: d["start_date"])
+            if dispatches:
+                st.write("**派工紀錄：**")
+                for d in dispatches:
+                    rng = d["start_date"] if d["start_date"] == d["end_date"] else f"{d['start_date']}~{d['end_date']}"
+                    st.caption(f"　{rng}：{d['workers']}")
+            else:
+                st.caption("尚未安排移工，請到「👷 移工指派」分頁指派。")
+
             if t.get("image_url"):
                 st.image(t["image_url"], caption="圖說", width=300)
 
@@ -252,45 +294,142 @@ def render_todo_tab():
                 st.rerun()
 
 
+def render_dispatch_assignment_tab():
+    st.subheader("👷 移工指派")
+
+    all_todos = data_store.get_todos()
+    active_todos = [t for t in all_todos if str(t.get("completed", "")).strip().upper() != "TRUE"]
+
+    if not active_todos:
+        st.info("目前沒有可指派的代辦事項，請先到「📋 代辦事項」分頁新增。")
+        return
+
+    today = datetime_now_taipei_date()
+    active_todos.sort(key=lambda t: t["start_date"])
+
+    def _fmt(t):
+        rng = t["start_date"] if t["start_date"] == t["end_date"] else f"{t['start_date']}~{t['end_date']}"
+        loc = f"／{t['location']}" if t.get("location") else ""
+        return f"{t['task']}（{rng}{loc}）"
+
+    labels = [_fmt(t) for t in active_todos]
+    picked_idx = st.selectbox(
+        "選擇代辦事項", range(len(active_todos)), format_func=lambda i: labels[i], key="dispatch_todo_select"
+    )
+    todo = active_todos[picked_idx]
+
+    todo_start = date.fromisoformat(todo["start_date"])
+    todo_end = date.fromisoformat(todo["end_date"])
+    st.caption(f"這筆事項整體區間：{todo_start} ～ {todo_end}")
+
+    use_range = st.checkbox("指定一段區間（不勾選的話，預設只有選的那一天生效）", key="dispatch_use_range")
+
+    default_single = min(max(today, todo_start), todo_end)
+    if use_range:
+        c1, c2 = st.columns(2)
+        d_start = c1.date_input("派工開始日期", value=todo_start, min_value=todo_start, max_value=todo_end, key="dispatch_range_start")
+        d_end = c2.date_input("派工結束日期", value=todo_end, min_value=todo_start, max_value=todo_end, key="dispatch_range_end")
+    else:
+        d_start = st.date_input("派工日期（只有這一天生效）", value=default_single, min_value=todo_start, max_value=todo_end, key="dispatch_single_date")
+        d_end = d_start
+
+    completed_ids = {t["id"] for t in all_todos if str(t.get("completed", "")).strip().upper() == "TRUE"}
+    all_dispatches = data_store.get_dispatches()
+    todos_by_id = {t["id"]: t for t in all_todos}
+    busy = _compute_busy_workers_dispatch(all_dispatches, d_start, d_end, completed_todo_ids=completed_ids)
+
+    worker_options = data_store.get_options("worker")
+    if not worker_options:
+        st.warning("目前沒有移工選項，請先到「📋 代辦事項」分頁的「⚙️ 管理選單」新增。")
+        return
+
+    with st.form("dispatch_form", clear_on_submit=True):
+        st.markdown("**選擇移工（可複選；灰色代表這段期間已被其他派工佔用）**")
+        selected = []
+        for w in worker_options:
+            is_busy = w in busy
+            label = w
+            if is_busy:
+                occ = busy[w]
+                occ_todo = todos_by_id.get(occ["todo_id"])
+                occ_task = occ_todo["task"] if occ_todo else "（事項已刪除）"
+                occ_rng = occ["start_date"] if occ["start_date"] == occ["end_date"] else f"{occ['start_date']}~{occ['end_date']}"
+                label = f"{w}　⚠️ 已指派於「{occ_task}」（{occ_rng}）"
+            checked = st.checkbox(label, value=False, disabled=is_busy, key=f"dispatch_worker_{w}")
+            if checked:
+                selected.append(w)
+
+        submitted = st.form_submit_button("指派")
+
+    if submitted:
+        if d_end < d_start:
+            st.error("結束日期不能早於開始日期")
+        elif not selected:
+            st.error("請至少選一位移工")
+        else:
+            record = data_store.add_dispatch(todo["id"], str(d_start), str(d_end), data_store.join_workers(selected))
+            st.success("已指派")
+            _notify_discord_dispatch(todo, record)
+            st.rerun()
+
+    st.divider()
+    st.subheader(f"「{todo['task']}」目前的派工紀錄")
+
+    dispatches_for_todo = sorted(data_store.get_dispatches_for_todo(todo["id"]), key=lambda d: d["start_date"])
+    if not dispatches_for_todo:
+        st.info("這筆事項目前還沒有任何派工紀錄。")
+        return
+
+    for d in dispatches_for_todo:
+        rng = d["start_date"] if d["start_date"] == d["end_date"] else f"{d['start_date']}~{d['end_date']}"
+        c1, c2 = st.columns([5, 1])
+        c1.write(f"**{rng}**：{d['workers']}")
+        if c2.button("刪除", key=f"del_dispatch_{d['id']}"):
+            data_store.delete_dispatch(d["id"])
+            st.rerun()
+
+
 def render_dispatch_tab():
     st.subheader("📅 每日派工總表")
 
-    pick_date = st.date_input("選擇日期", value=datetime_now_taipei_date(), key="dispatch_date")
-    only_dispatched = st.checkbox("只顯示有指派移工的項目", value=True, key="dispatch_only_assigned")
+    pick_date = st.date_input("選擇日期", value=datetime_now_taipei_date(), key="dispatch_board_date")
 
     todos = data_store.get_todos()
+    todos_by_id = {t["id"]: t for t in todos}
+    dispatches = data_store.get_dispatches()
 
-    def _in_range(t):
+    def _d_in_range(d):
         try:
-            s = date.fromisoformat(t["start_date"])
-            e = date.fromisoformat(t["end_date"])
+            s = date.fromisoformat(d["start_date"])
+            e = date.fromisoformat(d["end_date"])
         except (ValueError, TypeError):
             return False
         return s <= pick_date <= e
 
-    matched = [t for t in todos if _in_range(t)]
-    if only_dispatched:
-        matched = [t for t in matched if t.get("workers")]
-
-    if not matched:
-        st.info(f"{pick_date} 沒有符合條件的派工項目。")
-        return
+    matched_dispatches = [d for d in dispatches if _d_in_range(d)]
 
     today = datetime_now_taipei_date()
 
-    def _sort_key(t):
+    def _sort_key(d):
+        t = todos_by_id.get(d["todo_id"])
+        if not t:
+            return len(urgency.TIER_ORDER)
         tier = urgency.classify_tier(t["end_date"], today)
         return urgency.TIER_ORDER.index(tier) if tier in urgency.TIER_ORDER else len(urgency.TIER_ORDER)
 
-    matched.sort(key=_sort_key)
+    matched_dispatches.sort(key=_sort_key)
 
     rows = []
     total_workers = set()
-    for t in matched:
+    dispatched_todo_ids = set()
+    for d in matched_dispatches:
+        t = todos_by_id.get(d["todo_id"])
+        if not t:
+            continue  # 事項已被刪除，這筆派工紀錄是孤兒資料，略過不顯示
+        dispatched_todo_ids.add(t["id"])
         completed = str(t.get("completed", "")).strip().upper() == "TRUE"
         tier = urgency.classify_tier(t["end_date"], today)
-        date_range = t["start_date"] if t["start_date"] == t["end_date"] else f"{t['start_date']}~{t['end_date']}"
-        workers_list = data_store.split_workers(t.get("workers", ""))
+        workers_list = data_store.split_workers(d.get("workers", ""))
         total_workers.update(workers_list)
         rows.append({
             "分級": urgency.TIER_ICONS.get(tier, "⚪") if tier else "⚪",
@@ -299,18 +438,38 @@ def render_dispatch_tab():
             "工項": t["work_item"],
             "類型": t["type"],
             "地點": t.get("location") or "－",
-            "移工名單": t.get("workers") or "－",
-            "期限": date_range,
+            "移工名單": d.get("workers") or "－",
             "狀態": "已完成" if completed else "進行中",
         })
-
-    df = pd.DataFrame(rows)
 
     c1, c2 = st.columns(2)
     c1.metric("當天派工項目數", len(rows))
     c2.metric("涉及移工人數", len(total_workers))
 
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    if rows:
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    else:
+        st.info(f"{pick_date} 目前沒有任何派工紀錄。")
+
+    # 當天區間內、但還沒有派工紀錄覆蓋到的未完成事項，提醒要盡快安排人力
+    def _t_in_range(t):
+        try:
+            s = date.fromisoformat(t["start_date"])
+            e = date.fromisoformat(t["end_date"])
+        except (ValueError, TypeError):
+            return False
+        return s <= pick_date <= e
+
+    unassigned = [
+        t for t in todos
+        if t["id"] not in dispatched_todo_ids
+        and str(t.get("completed", "")).strip().upper() != "TRUE"
+        and _t_in_range(t)
+    ]
+    if unassigned:
+        st.warning(f"⚠️ 以下 {len(unassigned)} 筆事項在 {pick_date} 這天還沒有安排移工：")
+        for t in unassigned:
+            st.write(f"・{t['task']}（{t['work_item']}／{t.get('location') or '無地點'}）")
 
 
 def render_experience_tab():
@@ -359,12 +518,14 @@ def main():
     _init_state()
     st.title("🏗️ 營造管理系統")
 
-    tab1, tab2, tab3 = st.tabs(["📋 代辦事項", "📅 派工總表", "📚 經驗分享區"])
+    tab1, tab2, tab3, tab4 = st.tabs(["📋 代辦事項", "👷 移工指派", "📅 派工總表", "📚 經驗分享區"])
     with tab1:
         render_todo_tab()
     with tab2:
-        render_dispatch_tab()
+        render_dispatch_assignment_tab()
     with tab3:
+        render_dispatch_tab()
+    with tab4:
         render_experience_tab()
 
 
