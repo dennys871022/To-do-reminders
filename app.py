@@ -406,48 +406,50 @@ def render_dispatch_tab():
 
     matched_dispatches = [d for d in dispatches if _d_in_range(d)]
 
-    today = datetime_now_taipei_date()
-
-    def _sort_key(d):
-        t = todos_by_id.get(d["todo_id"])
-        if not t:
-            return len(urgency.TIER_ORDER)
-        tier = urgency.classify_tier(t["end_date"], today)
-        return urgency.TIER_ORDER.index(tier) if tier in urgency.TIER_ORDER else len(urgency.TIER_ORDER)
-
-    matched_dispatches.sort(key=_sort_key)
-
-    rows = []
-    total_workers = set()
-    dispatched_todo_ids = set()
+    # 同一個代辦事項當天可能有好幾筆派工紀錄（分好幾次指派），合併成一筆，
+    # 移工名單取聯集（去重），這樣同一事項在總表上只會出現一張卡片。
+    by_todo = {}
     for d in matched_dispatches:
         t = todos_by_id.get(d["todo_id"])
         if not t:
             continue  # 事項已被刪除，這筆派工紀錄是孤兒資料，略過不顯示
-        dispatched_todo_ids.add(t["id"])
-        completed = str(t.get("completed", "")).strip().upper() == "TRUE"
-        tier = urgency.classify_tier(t["end_date"], today)
-        workers_list = data_store.split_workers(d.get("workers", ""))
-        total_workers.update(workers_list)
-        rows.append({
-            "分級": urgency.TIER_ICONS.get(tier, "⚪") if tier else "⚪",
-            "指派人": t.get("engineer") or "－",
-            "事項說明": t["task"],
-            "工項": t["work_item"],
-            "類型": t["type"],
-            "地點": t.get("location") or "－",
-            "移工名單": d.get("workers") or "－",
-            "狀態": "已完成" if completed else "進行中",
-        })
+        entry = by_todo.setdefault(t["id"], {"todo": t, "workers": set()})
+        entry["workers"].update(data_store.split_workers(d.get("workers", "")))
+
+    today = datetime_now_taipei_date()
+
+    def _sort_key(entry):
+        tier = urgency.classify_tier(entry["todo"]["end_date"], today)
+        return urgency.TIER_ORDER.index(tier) if tier in urgency.TIER_ORDER else len(urgency.TIER_ORDER)
+
+    merged_entries = sorted(by_todo.values(), key=_sort_key)
+
+    total_workers = set()
+    for entry in merged_entries:
+        total_workers.update(entry["workers"])
 
     c1, c2 = st.columns(2)
-    c1.metric("當天派工項目數", len(rows))
+    c1.metric("當天派工項目數", len(merged_entries))
     c2.metric("涉及移工人數", len(total_workers))
 
-    if rows:
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    else:
+    if not merged_entries:
         st.info(f"{pick_date} 目前沒有任何派工紀錄。")
+    else:
+        for entry in merged_entries:
+            t = entry["todo"]
+            completed = str(t.get("completed", "")).strip().upper() == "TRUE"
+            tier = urgency.classify_tier(t["end_date"], today)
+            icon = urgency.TIER_ICONS.get(tier, "⚪") if tier else "⚪"
+            workers_text = "、".join(sorted(entry["workers"])) if entry["workers"] else "－"
+
+            with st.container(border=True):
+                st.markdown(f"{icon} **{t['task']}**　{'（已完成）' if completed else ''}")
+                st.write(f"工項／類型：{t['work_item']}／{t['type']}　　地點：{t.get('location') or '－'}")
+                if t.get("engineer"):
+                    st.write(f"指派人：{t['engineer']}")
+                st.write(f"移工：{workers_text}")
+
+    dispatched_todo_ids = set(by_todo.keys())
 
     # 當天區間內、但還沒有派工紀錄覆蓋到的未完成事項，提醒要盡快安排人力
     def _t_in_range(t):
