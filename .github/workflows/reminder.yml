@@ -1,12 +1,11 @@
 name: Discord 代辦提醒排程
 
+# 【改版重點】拿掉 GitHub 自己的 schedule 排程，因為實測發現 GitHub 免費方案
+# 對排程觸發做了嚴格節流，設定的頻率大部分都被跳過，不可靠。
+# 改成完全依賴外部服務（cron-job.org）在準確的 3 個時間點，呼叫 GitHub REST API
+# 的 workflow_dispatch 來觸發這支 workflow——workflow_dispatch 走的是手動觸發
+# 路徑，幾乎是即時執行，不會卡在 GitHub 的排程佇列裡。
 on:
-  schedule:
-    # 台灣時間 08:17 ~ 18:47 之間，每 30 分鐘檢查一次（UTC 00:17 ~ 10:47）。
-    # 故意避開整點，因為 GitHub 整點最擁擠、延遲最嚴重。
-    # 程式有「這個時段已提醒過就不重發」的保護，密集檢查不會造成重複推播；
-    # 就算 GitHub 延遲或跳過其中幾次，後面的檢查也會自動補發。
-    - cron: "17,47 0-10 * * *"
   workflow_dispatch:
     inputs:
       force:
