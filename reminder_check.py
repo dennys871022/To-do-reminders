@@ -11,7 +11,7 @@ Discord webhook 沒有月則數上限，不用再像 LINE 那樣把發送次數�
 - 已完成、或超過 30 天到期的事項不提醒
 
 不怕 GitHub 排程延遲：每個時段過了之後，MAX_LATE_HOURS 小時內只要還沒
-提醒過就會補發；晚上 19:00 ～ 早上 07:00 為安靜時段不發送。
+提醒過就會補發；晚上 21:00 ～ 早上 07:00 為安靜時段不發送。
 
 同一次執行有多筆事項到期，合併成一則 Discord 訊息（附開啟 App 連結）。
 
@@ -21,7 +21,7 @@ Discord webhook 沒有月則數上限，不用再像 LINE 那樣把發送次數�
 """
 
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date as date_cls
 from zoneinfo import ZoneInfo
 
 import data_store
@@ -34,7 +34,7 @@ TZ = ZoneInfo("Asia/Taipei")
 MAX_LATE_HOURS = 6
 
 # 安靜時段（台灣時間）：這段時間不發送
-QUIET_START_HOUR = 19
+QUIET_START_HOUR = 21
 QUIET_END_HOUR = 7
 
 # 你的 Streamlit App 網址，附在訊息下方
@@ -92,20 +92,47 @@ def _check_due(todo, tier, now_local):
     return False, f"時段 {slot:%H:%M} 已提醒過（上次 {last_local:%m/%d %H:%M}）"
 
 
-def _build_batch_text(items_by_tier, test_mode=False):
+def _today_workers(todo_id, today):
+    """這筆事項「今天」有效的派工紀錄裡，指派了哪些移工（跨好幾筆派工紀錄會合併去重）。"""
+    workers = set()
+    for d in data_store.get_dispatches_for_todo(todo_id):
+        try:
+            ds = date_cls.fromisoformat(d["start_date"])
+            de = date_cls.fromisoformat(d["end_date"])
+        except (ValueError, TypeError):
+            continue
+        if ds <= today <= de:
+            workers.update(data_store.split_workers(d.get("workers", "")))
+    return workers
+
+
+def _build_batch_text(items_by_tier, today, test_mode=False):
     total = sum(len(v) for v in items_by_tier.values())
     head = "【測試】" if test_mode else ""
-    lines = [f"{head}**【代辦提醒】共 {total} 筆事項需要注意**\n"]
+    lines = [f"{head}**【代辦提醒】共 {total} 筆事項需要注意**"]
+
     for tier in urgency.TIER_ORDER:
         for t in items_by_tier.get(tier, []):
-            loc = f"／{t.get('location')}" if t.get("location") else ""
+            icon = urgency.TIER_ICONS.get(tier, "⚪")
             date_range = t["start_date"]
             if t["start_date"] != t["end_date"]:
                 date_range += f"~{t['end_date']}"
-            lines.append(
-                f"・[{tier}] {t['task']}\n"
-                f"　{t['work_item']}／{t['type']}{loc}／期限 {date_range}"
-            )
+
+            lines.append("")  # 空行分隔，每筆事項獨立一個區塊，更好辨識
+            lines.append(f"{icon} **{t['task']}**　［{tier}］")
+
+            meta = f"　🏗️ {t['work_item']}／{t['type']}"
+            if t.get("location"):
+                meta += f"　📍 {t['location']}"
+            lines.append(meta)
+            lines.append(f"　📅 期限：{date_range}")
+
+            workers = _today_workers(t["id"], today)
+            if workers:
+                lines.append(f"　👷 今日移工：{'、'.join(sorted(workers))}")
+            else:
+                lines.append("　👷 今日尚未指派移工")
+
     return "\n".join(lines)
 
 
@@ -153,7 +180,7 @@ def run(now_utc, force=False):
     for t in due:
         items_by_tier.setdefault(t["_tier"], []).append(t)
 
-    text = _build_batch_text(items_by_tier, test_mode=force)
+    text = _build_batch_text(items_by_tier, today, test_mode=force)
 
     try:
         send_discord_message(text, button_label="📋 開啟代辦系統", button_url=APP_URL)
