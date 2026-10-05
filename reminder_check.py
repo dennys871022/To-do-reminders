@@ -1,23 +1,23 @@
 """
 reminder_check.py
 -------------------
-【改用 Discord 後恢復原始設計：一天最多 3 次，不再需要額度保護】
-Discord webhook 沒有月則數上限，不用再像 LINE 那樣把發送次數壓到最低，
-所以恢復成最初設計：
+【改版：用時間決定內容，不再用緊急程度決定頻率】
 
-- 非常緊急（3天內到期）：一天提醒 3 次：08:00 / 13:30 / 17:00
-- 緊急（本週內到期）：一天提醒 1 次：08:00
-- 一般（本月內到期）：每 3 天提醒 1 次：08:00
-- 已完成、或超過 30 天到期的事項不提醒
+- 08:00：完整晨報。分兩段——① 今天已有派工的事項（不分緊急程度，顯示對應移工）
+  ② 其餘未派工事項，依非常緊急／緊急／一般分類列出
+- 13:30：只列「非常緊急」的事項，當天再提醒一次最急的
+- 17:00：完整晚報，內容格式跟 08:00 相同，收工前再看一次全貌，方便安排隔天派工
 
-不怕 GitHub 排程延遲：每個時段過了之後，MAX_LATE_HOURS 小時內只要還沒
-提醒過就會補發；晚上 21:00 ～ 早上 07:00 為安靜時段不發送。
+已完成、或超過 30 天到期的事項不列入（超過 30 天的太早，還不用管）。
+晚上 21:00 ～ 早上 07:00 為安靜時段不發送。
 
-同一次執行有多筆事項到期，合併成一則 Discord 訊息（附開啟 App 連結）。
+這支腳本現在搭配外部排程服務（例如 cron-job.org）在台灣時間 08:00／13:30／17:00
+準時呼叫 GitHub 的 workflow_dispatch 來觸發，不再依賴 GitHub 自己的 schedule
+（已證實常被節流、不準時）。MAX_LATE_HOURS 只是留一點緩衝，應付外部服務偶爾的
+極小延遲，不是主要的準時機制。
 
 【測試用】環境變數 FORCE_SEND=true（GitHub Actions 手動執行時勾選 force）：
-忽略時段與安靜時段，立刻把所有「未完成且 30 天內到期」的事項發到頻道，
-訊息開頭標示【測試】，且不會更新提醒紀錄，不影響正式排程。
+忽略時段，立刻發送完整報告，訊息開頭標示【測試】。
 """
 
 import os
@@ -30,11 +30,14 @@ from discord_notify import send_discord_message
 
 TZ = ZoneInfo("Asia/Taipei")
 
-# 錯過提醒時段後，最晚還願意補發到幾小時內（GitHub 排程常延遲數小時）
-MAX_LATE_HOURS = 6
+# 三個固定時段（台灣時間）
+TIME_SLOTS = [(8, 0), (13, 30), (17, 0)]
+
+# 時段過了之後，最晚還願意算數的緩衝時間（外部排程服務應該都很準，這裡抓小一點）
+MAX_LATE_HOURS = 2
 
 # 安靜時段（台灣時間）：這段時間不發送
-QUIET_START_HOUR = 21
+QUIET_START_HOUR = 19
 QUIET_END_HOUR = 7
 
 # 你的 Streamlit App 網址，附在訊息下方
@@ -45,51 +48,15 @@ def _is_completed(todo):
     return str(todo.get("completed", "")).strip().upper() == "TRUE"
 
 
-def _parse_iso(value):
-    if not value:
-        return None
-    try:
-        dt = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
-
-
-def _latest_slot(now_local, slots):
-    """今天已經過了的、最近的一個提醒時段；還沒到任何時段則回傳 None。"""
-    passed = [
-        now_local.replace(hour=h, minute=m, second=0, microsecond=0)
-        for h, m in slots
-        if now_local.replace(hour=h, minute=m, second=0, microsecond=0) <= now_local
-    ]
-    return max(passed) if passed else None
-
-
-def _check_due(todo, tier, now_local):
-    """回傳 (是否要提醒, 原因說明)，方便寫進 log 除錯。"""
-    slot = _latest_slot(now_local, urgency.TIER_SLOTS[tier])
-    if slot is None:
-        return False, "今天還沒到第一個提醒時段"
-    late = now_local - slot
-    if late > timedelta(hours=MAX_LATE_HOURS):
-        return False, f"最近時段 {slot:%H:%M} 已過 {late.total_seconds()/3600:.1f} 小時，超過補發期限"
-
-    last = _parse_iso(todo.get("last_reminder_at"))
-    if last is None:
-        return True, f"從未提醒過（時段 {slot:%H:%M}）"
-    last_local = last.astimezone(TZ)
-
-    if tier == "一般":
-        days = (now_local.date() - last_local.date()).days
-        if days >= 3:
-            return True, f"一般事項距上次提醒 {days} 天"
-        return False, f"一般事項每 3 天一次，距上次提醒才 {days} 天"
-
-    if last_local < slot:
-        return True, f"時段 {slot:%H:%M} 尚未提醒（上次 {last_local:%m/%d %H:%M}）"
-    return False, f"時段 {slot:%H:%M} 已提醒過（上次 {last_local:%m/%d %H:%M}）"
+def _current_slot(now_local):
+    """回傳現在對應到的那個時段（datetime），在任何時段的 MAX_LATE_HOURS 內才算數；
+    都不符合就回傳 None。"""
+    candidates = []
+    for h, m in TIME_SLOTS:
+        s = now_local.replace(hour=h, minute=m, second=0, microsecond=0)
+        if s <= now_local and (now_local - s) <= timedelta(hours=MAX_LATE_HOURS):
+            candidates.append(s)
+    return max(candidates) if candidates else None
 
 
 def _today_workers(todo_id, today):
@@ -106,34 +73,82 @@ def _today_workers(todo_id, today):
     return workers
 
 
-def _build_batch_text(items_by_tier, today, test_mode=False):
-    total = sum(len(v) for v in items_by_tier.values())
+def _item_lines(t, tier, icon, workers):
+    date_range = t["start_date"]
+    if t["start_date"] != t["end_date"]:
+        date_range += f"~{t['end_date']}"
+
+    title = f"{icon} **{t['task']}**"
+    if tier:
+        title += f"　［{tier}］"
+    lines = [title]
+
+    meta = f"　🏗️ {t['work_item']}／{t['type']}"
+    if t.get("location"):
+        meta += f"　📍 {t['location']}"
+    lines.append(meta)
+    lines.append(f"　📅 期限：{date_range}")
+
+    if workers:
+        lines.append(f"　👷 今日移工：{'、'.join(sorted(workers))}")
+
+    return lines
+
+
+def _build_full_report(active_todos, today, test_mode=False):
+    """08:00／17:00 用的完整報告：今日派工段落 + 依緊急程度的未派工段落。"""
+    dispatched = []  # (tier, todo, workers)
+    pending_by_tier = {tier: [] for tier in urgency.TIER_ORDER}
+
+    for t in active_todos:
+        tier = urgency.classify_tier(t.get("end_date"), today)
+        workers = _today_workers(t["id"], today)
+        if workers:
+            dispatched.append((tier, t, workers))
+        elif tier:
+            pending_by_tier[tier].append(t)
+
+    total = len(dispatched) + sum(len(v) for v in pending_by_tier.values())
     head = "【測試】" if test_mode else ""
     lines = [f"{head}**【代辦提醒】共 {total} 筆事項需要注意**"]
 
-    for tier in urgency.TIER_ORDER:
-        for t in items_by_tier.get(tier, []):
-            icon = urgency.TIER_ICONS.get(tier, "⚪")
-            date_range = t["start_date"]
-            if t["start_date"] != t["end_date"]:
-                date_range += f"~{t['end_date']}"
+    if dispatched:
+        dispatched.sort(
+            key=lambda x: urgency.TIER_ORDER.index(x[0]) if x[0] in urgency.TIER_ORDER else len(urgency.TIER_ORDER)
+        )
+        lines.append("")
+        lines.append("📌 **今日派工項目**")
+        for tier, t, workers in dispatched:
+            icon = urgency.TIER_ICONS.get(tier, "⚪") if tier else "⚪"
+            lines.append("")
+            lines.extend(_item_lines(t, tier, icon, workers))
 
-            lines.append("")  # 空行分隔，每筆事項獨立一個區塊，更好辨識
-            lines.append(f"{icon} **{t['task']}**　［{tier}］")
+    if any(pending_by_tier.values()):
+        lines.append("")
+        lines.append("⏰ **依緊急程度（尚未安排移工）**")
+        for tier in urgency.TIER_ORDER:
+            for t in pending_by_tier[tier]:
+                lines.append("")
+                lines.extend(_item_lines(t, tier, urgency.TIER_ICONS.get(tier, "⚪"), None))
 
-            meta = f"　🏗️ {t['work_item']}／{t['type']}"
-            if t.get("location"):
-                meta += f"　📍 {t['location']}"
-            lines.append(meta)
-            lines.append(f"　📅 期限：{date_range}")
+    return total, "\n".join(lines)
 
-            workers = _today_workers(t["id"], today)
-            if workers:
-                lines.append(f"　👷 今日移工：{'、'.join(sorted(workers))}")
-            else:
-                lines.append("　👷 今日尚未指派移工")
 
-    return "\n".join(lines)
+def _build_urgent_only_text(active_todos, today, test_mode=False):
+    """13:30 用的簡短提醒：只列「非常緊急」的事項。"""
+    items = []
+    for t in active_todos:
+        tier = urgency.classify_tier(t.get("end_date"), today)
+        if tier == "非常緊急":
+            items.append((t, _today_workers(t["id"], today)))
+
+    head = "【測試】" if test_mode else ""
+    lines = [f"{head}**【午間提醒】非常緊急事項共 {len(items)} 筆**"]
+    for t, workers in items:
+        lines.append("")
+        lines.extend(_item_lines(t, "非常緊急", "🔴", workers))
+
+    return len(items), "\n".join(lines)
 
 
 def run(now_utc, force=False):
@@ -141,46 +156,35 @@ def run(now_utc, force=False):
     today = now_local.date()
     print(f"[執行時間] 台灣時間 {now_local:%Y-%m-%d %H:%M}　強制測試模式：{force}")
 
-    if not force:
+    if force:
+        report_type = "full"
+    else:
         in_quiet = now_local.hour >= QUIET_START_HOUR or now_local.hour < QUIET_END_HOUR
         if in_quiet:
             print(f"目前是安靜時段（{QUIET_START_HOUR}:00～{QUIET_END_HOUR}:00），不發送。")
             return
 
+        slot = _current_slot(now_local)
+        if slot is None:
+            print("目前不在任何提醒時段附近（08:00／13:30／17:00），不發送。")
+            return
+        slot_label = f"{slot.hour:02d}:{slot.minute:02d}"
+        print(f"[對應時段] {slot_label}")
+        report_type = "urgent_only" if slot_label == "13:30" else "full"
+
     todos = data_store.get_todos()
-    print(f"[資料] 共讀到 {len(todos)} 筆代辦事項")
+    active_todos = [t for t in todos if not _is_completed(t)]
+    print(f"[資料] 共 {len(todos)} 筆代辦事項，{len(active_todos)} 筆進行中")
 
-    due = []
-    for t in todos:
-        label = f"{str(t.get('task', ''))[:14]}（期限 {t.get('end_date')}）"
-        if _is_completed(t):
-            print(f"  - {label}：已完成，略過")
-            continue
+    if report_type == "full":
+        total, text = _build_full_report(active_todos, today, test_mode=force)
+    else:
+        total, text = _build_urgent_only_text(active_todos, today, test_mode=force)
 
-        tier = urgency.classify_tier(t.get("end_date"), today)
-        if tier is None:
-            print(f"  - {label}：超過 30 天尚未進入提醒範圍，略過")
-            continue
-
-        if force:
-            ok, reason = True, "強制測試模式"
-        else:
-            ok, reason = _check_due(t, tier, now_local)
-        print(f"  - {label}：[{tier}] {'✅提醒' if ok else '略過'}：{reason}")
-        if ok:
-            t["_tier"] = tier
-            due.append(t)
-
-    print(f"[判斷結果] 需提醒 {len(due)} 筆")
-    if not due:
+    print(f"[判斷結果] 本次報告涵蓋 {total} 筆事項")
+    if total == 0:
         print("目前沒有需要提醒的事項。")
         return
-
-    items_by_tier = {}
-    for t in due:
-        items_by_tier.setdefault(t["_tier"], []).append(t)
-
-    text = _build_batch_text(items_by_tier, today, test_mode=force)
 
     try:
         send_discord_message(text, button_label="📋 開啟代辦系統", button_url=APP_URL)
@@ -188,20 +192,18 @@ def run(now_utc, force=False):
         print(f"推播失敗，Discord 訊息沒有送出：{e}")
         raise SystemExit(1)  # 讓 workflow 顯示紅色失敗，方便及早發現
 
-    print(f"已推播 1 則訊息（涵蓋 {len(due)} 筆事項）。")
+    print(f"已推播 1 則訊息（涵蓋 {total} 筆事項）。")
 
     if force:
         print("（測試模式：不更新提醒紀錄）")
         return
 
-    for t in due:
+    # 這個新模型不再用 last_reminder_at 來決定「要不要發」，純粹留作歷史參考用。
+    for t in active_todos:
         try:
             data_store.mark_reminder_sent(t["id"], now_utc.isoformat())
         except Exception as e:
-            print(
-                f"⚠️ 警告：id={t['id']} 的提醒訊息已送出，"
-                f"但更新「上次提醒時間」失敗（{e}），下次執行有機率重複提醒這筆。"
-            )
+            print(f"⚠️ 警告：id={t['id']} 更新提醒時間失敗（{e}），不影響本次推播結果。")
 
 
 def main():
