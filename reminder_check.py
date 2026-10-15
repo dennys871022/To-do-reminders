@@ -194,16 +194,9 @@ def run(now_utc, force=False):
 
     print(f"已推播 1 則訊息（涵蓋 {total} 筆事項）。")
 
-    if force:
-        print("（測試模式：不更新提醒紀錄）")
-        return
-
-    # 這個新模型不再用 last_reminder_at 來決定「要不要發」，純粹留作歷史參考用。
-    for t in active_todos:
-        try:
-            data_store.mark_reminder_sent(t["id"], now_utc.isoformat())
-        except Exception as e:
-            print(f"⚠️ 警告：id={t['id']} 更新提醒時間失敗（{e}），不影響本次推播結果。")
+    # 注意：這裡刻意不再逐筆更新 last_reminder_at。新的提醒模型是「時間到就發當下的快照」，
+    # 完全不看這個欄位；逐筆更新會讓每筆事項多打 1～3 次 Google API（30 筆事項就是近百次寫入），
+    # 容易撞到頻率限制，還會拖慢同一時間打開 App 的使用者。
 
 
 def main():
