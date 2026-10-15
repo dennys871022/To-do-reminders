@@ -1,4 +1,4 @@
-streamlit>=1.38
+streamlit>=1.50
 gspread>=6.1
 google-auth>=2.32
 requests>=2.32
