@@ -140,43 +140,85 @@ def _notify_discord_instant(todo, action):
         lines.append(f"期限：{date_range}")
         if todo.get("engineer"):
             lines.append(f"指派人：{todo['engineer']}")
+        if data_store.is_shareable(todo):
+            lines.append("🔁 可共用（可與其他工項共用移工）")
 
         _send_discord_async("\n".join(lines))
     except Exception:
         traceback.print_exc()  # 組訊息出錯也不能影響已經存好的資料
 
 
-def _compute_busy_workers_dispatch(all_dispatches, start_date, end_date, exclude_id=None, completed_todo_ids=None):
+def _is_done(todo):
+    return str(todo.get("completed", "")).strip().upper() == "TRUE"
+
+
+def _fmt_range(start, end):
+    return start if start == end else f"{start}~{end}"
+
+
+def _overlapping_assignments(all_dispatches, todos_by_id, start_date, end_date, exclude_id=None):
     """
-    算出在 [start_date, end_date] 這段期間，已經被排進「其他」派工紀錄的移工。
-    completed_todo_ids：所屬事項已標記完成的 todo_id 集合，這些派工紀錄不算佔用
-    （事項做完了，人就該空出來）。
-    回傳 {移工姓名: 佔用的那筆派工紀錄 dict}（取第一筆佔用的，方便顯示原因）。
+    找出每位移工在 [start_date, end_date] 這段期間「已經有的安排」。
+    回傳 {移工: [{"todo": 事項, "ranges": [重疊的派工日期, ...]}, ...]}（同一事項只列一次）。
+    已完成的事項、已經被刪除的事項（孤兒派工紀錄，例如你直接在試算表刪掉事項那一列）不算安排。
     """
-    completed_todo_ids = completed_todo_ids or set()
-    busy = {}
+    result = {}
     for d in all_dispatches:
         if exclude_id and d["id"] == exclude_id:
             continue
-        if d.get("todo_id") in completed_todo_ids:
+        t = todos_by_id.get(d["todo_id"])
+        if t is None or _is_done(t):
             continue
         try:
             ds = date.fromisoformat(d["start_date"])
             de = date.fromisoformat(d["end_date"])
         except (ValueError, TypeError):
             continue
-        if ds <= end_date and de >= start_date:  # 期間重疊
-            for w in data_store.split_workers(d.get("workers", "")):
-                busy.setdefault(w, d)
-    return busy
+        if not (ds <= end_date and de >= start_date):  # 期間沒有重疊
+            continue
+        for w in data_store.split_workers(d.get("workers", "")):
+            entries = result.setdefault(w, [])
+            entry = next((x for x in entries if x["todo"]["id"] == t["id"]), None)
+            if entry is None:
+                entry = {"todo": t, "ranges": []}
+                entries.append(entry)
+            entry["ranges"].append(_fmt_range(d["start_date"], d["end_date"]))
+    return result
+
+
+def _describe_assignments(entries):
+    """把一位移工的所有既有安排寫成一行：「事項」（工項／地點，日期，可共用或不可共用）。"""
+    parts = []
+    for x in entries:
+        t = x["todo"]
+        place = f"{t['work_item']}／{t['location']}" if t.get("location") else t["work_item"]
+        share = "可共用" if data_store.is_shareable(t) else "不可共用"
+        parts.append(f"「{t['task']}」（{place}，{'、'.join(x['ranges'])}，{share}）")
+    return "；".join(parts)
+
+
+def _block_reason(entries, picked_todo_id, new_shareable):
+    """這位移工能不能指派給目前這筆事項？可以就回傳 None，不行就回傳原因。
+    規則：① 同一筆事項不能重複安排同一位移工；
+          ② 只有「兩筆都不可共用」的安排才算衝突；只要其中一筆標記了「可共用」，就可以疊在一起。
+    第 ② 點刻意設計成「跟誰先排無關」：先排獨占的事項 X、再把可共用的 S 疊上去，
+    和先排 S 再排 X，結果一樣；否則之後回頭編輯 X 時，會被已經合法疊上去的 S 判成衝突而存不了。"""
+    if any(x["todo"]["id"] == picked_todo_id for x in entries):
+        return "本事項這段期間已安排過這位移工"
+    if not new_shareable:
+        exclusive = [x["todo"]["task"] for x in entries if not data_store.is_shareable(x["todo"])]
+        if exclusive:
+            names = "、".join(f"「{n}」" for n in exclusive)
+            return f"本事項與{names}都不可共用，不能重疊"
+    return None
 
 
 def _notify_discord_dispatch(todo, dispatch):
     """新增派工紀錄後，在背景發一則 Discord 通知。"""
     try:
-        rng = dispatch["start_date"] if dispatch["start_date"] == dispatch["end_date"] else f"{dispatch['start_date']}~{dispatch['end_date']}"
+        rng = _fmt_range(dispatch["start_date"], dispatch["end_date"])
         lines = [
-            "👷 **新增派工**",
+            "👷 **新增派工**" + ("　🔁 可共用" if data_store.is_shareable(todo) else ""),
             f"{todo['task']}",
             f"工項：{todo['work_item']}／類型：{todo['type']}",
         ]
@@ -186,6 +228,29 @@ def _notify_discord_dispatch(todo, dispatch):
             lines.append(f"指派人：{todo['engineer']}")
         lines.append(f"派工日期：{rng}")
         lines.append(f"移工：{dispatch['workers']}")
+        _send_discord_async("\n".join(lines))
+    except Exception:
+        traceback.print_exc()
+
+
+def _notify_discord_dispatch_update(todo, old, new_start, new_end, new_workers, partial):
+    """修改派工紀錄（臨時換人、調整日期）後，在背景發一則 Discord 通知，讓大家知道有異動。"""
+    try:
+        old_rng = _fmt_range(old["start_date"], old["end_date"])
+        new_rng = _fmt_range(str(new_start), str(new_end))
+        lines = [
+            "🔄 **派工異動**",
+            f"{todo['task']}",
+            f"工項：{todo['work_item']}／類型：{todo['type']}",
+        ]
+        if todo.get("location"):
+            lines.append(f"地點：{todo['location']}")
+        if partial:
+            lines.append(f"原本（{old_rng}）：{old['workers']}")
+            lines.append(f"其中 {new_rng} 改為：{'、'.join(new_workers)}（其餘日期維持原樣）")
+        else:
+            lines.append(f"原本：{old_rng}　{old['workers']}")
+            lines.append(f"改為：{new_rng}　{'、'.join(new_workers)}")
         _send_discord_async("\n".join(lines))
     except Exception:
         traceback.print_exc()
@@ -226,6 +291,13 @@ def render_todo_tab():
         type_ = _select_with_add("類型", "type", "type_select")
         engineer = _select_with_add("指派人（工程師）", "engineer", "engineer_select")
 
+        shareable = st.checkbox(
+            "🔁 可共用（此工項可以與其他工項共用移工，例如只需 1 小時或半天就能完成）",
+            value=data_store.is_shareable(editing) if editing else False,
+            key=f"shareable_{st.session_state.editing_id or 'new'}",
+            help="勾選後，在「移工指派」可以把已經有其他安排的移工也派給這個工項（會列出他目前的安排讓你判斷）。",
+        )
+
         st.caption("💡 移工的每日派工，請到「👷 移工指派」分頁另外安排（同一個工項橫跨多天時，每天可以換不同的人）。")
 
         if editing and editing.get("image_url"):
@@ -258,7 +330,7 @@ def render_todo_tab():
             st.error("請完整選擇工項與類型")
         elif _is_duplicate_submit((
             "todo", st.session_state.editing_id, task.strip(), location,
-            str(start_date), str(end_date), work_item, type_, engineer,
+            str(start_date), str(end_date), work_item, type_, engineer, shareable,
         )):
             st.info("偵測到重複送出（10 秒內內容完全相同），已略過，沒有重複儲存。")
         else:
@@ -276,6 +348,7 @@ def render_todo_tab():
                         task=task, location=location,
                         work_item=work_item, type=type_,
                         engineer=engineer,
+                        shareable="TRUE" if shareable else "FALSE",
                         last_reminder_at="",
                     )
                     if image_url is not None:
@@ -286,7 +359,7 @@ def render_todo_tab():
                     saved_todo = data_store.add_todo(
                         str(start_date), str(end_date), task, location,
                         work_item, type_, image_url=image_url or "",
-                        engineer=engineer,
+                        engineer=engineer, shareable=shareable,
                     )
 
             st.session_state.editing_id = None
@@ -319,7 +392,7 @@ def render_todo_tab():
     for t in todos_sorted:
         label = urgency.tier_label(t["end_date"], today)
         date_range = t["start_date"] if t["start_date"] == t["end_date"] else f"{t['start_date']} ~ {t['end_date']}"
-        title = f"{label} {t['task']}"
+        title = f"{label} {t['task']}" + (" 🔁" if data_store.is_shareable(t) else "")
 
         with st.expander(title):
             st.write(f"**期限：** {date_range}")
@@ -328,6 +401,8 @@ def render_todo_tab():
                 st.write(f"**地點：** {t['location']}")
             if t.get("engineer"):
                 st.write(f"**指派人：** {t['engineer']}")
+            if data_store.is_shareable(t):
+                st.write("**可共用：** 是（可與其他工項共用移工）")
             st.write(f"**目前分級：** {label}")
 
             dispatches = sorted(dispatches_by_todo.get(t["id"], []), key=lambda d: d["start_date"])
@@ -357,91 +432,190 @@ def render_dispatch_assignment_tab():
     st.subheader("👷 移工指派")
 
     all_todos = data_store.get_todos()
-    active_todos = [t for t in all_todos if str(t.get("completed", "")).strip().upper() != "TRUE"]
+    active_todos = [t for t in all_todos if not _is_done(t)]
 
     if not active_todos:
         st.info("目前沒有可指派的代辦事項，請先到「📋 代辦事項」分頁新增。")
         return
 
+    all_dispatches = data_store.get_dispatches()
+    todos_by_id = {t["id"]: t for t in all_todos}
     today = datetime_now_taipei_date()
     active_todos.sort(key=lambda t: t["start_date"])
 
     def _fmt(t):
-        rng = t["start_date"] if t["start_date"] == t["end_date"] else f"{t['start_date']}~{t['end_date']}"
+        rng = _fmt_range(t["start_date"], t["end_date"])
         loc = f"／{t['location']}" if t.get("location") else ""
-        return f"{t['task']}（{rng}{loc}）"
+        return f"{t['task']}（{rng}{loc}）" + (" 🔁" if data_store.is_shareable(t) else "")
 
     # 選項用「事項 id」而不是「第幾筆」：多人同時使用時，別人新增或完成了事項，
     # 清單的順序會變，用順序當選項的話你選的事項會悄悄變成別的事項。
     ids = [t["id"] for t in active_todos]
     labels_by_id = {t["id"]: _fmt(t) for t in active_todos}
-    remembered = st.session_state.get("_dispatch_todo_id")
-    picked_id = st.selectbox(
-        "選擇代辦事項", ids,
-        index=ids.index(remembered) if remembered in ids else 0,
-        format_func=lambda i: labels_by_id[i],
-        key="dispatch_todo_select",
-    )
-    st.session_state["_dispatch_todo_id"] = picked_id  # 切到別頁再回來時，還記得選到哪一筆
-    todo = next(t for t in active_todos if t["id"] == picked_id)
+
+    # ---- 是否正在編輯某一筆派工紀錄
+    editing_dispatch = None
+    eid = st.session_state.get("editing_dispatch_id")
+    if eid:
+        editing_dispatch = next((d for d in all_dispatches if d["id"] == eid and d["todo_id"] in labels_by_id), None)
+        if editing_dispatch is None:  # 已被別人刪除，或它所屬的事項已經完成
+            st.session_state.editing_dispatch_id = None
+    # 編輯用的欄位 key 都帶上這個值：每次開始編輯都是全新的欄位，不會殘留上一次的勾選或日期
+    edit_key = editing_dispatch["id"] if editing_dispatch else "new"
+
+    if editing_dispatch:
+        picked_id = editing_dispatch["todo_id"]
+        st.info(
+            f"✏️ 正在編輯派工紀錄：{_fmt_range(editing_dispatch['start_date'], editing_dispatch['end_date'])}　"
+            f"{editing_dispatch['workers']}"
+        )
+        st.selectbox(
+            "代辦事項（編輯中不能更換）", ids, index=ids.index(picked_id),
+            format_func=lambda i: labels_by_id[i], disabled=True, key=f"dispatch_todo_select_{edit_key}",
+        )
+    else:
+        remembered = st.session_state.get("_dispatch_todo_id")
+        picked_id = st.selectbox(
+            "選擇代辦事項", ids,
+            index=ids.index(remembered) if remembered in ids else 0,
+            format_func=lambda i: labels_by_id[i],
+            key="dispatch_todo_select_new",
+        )
+        st.session_state["_dispatch_todo_id"] = picked_id  # 切到別頁再回來時，還記得選到哪一筆
+    todo = todos_by_id[picked_id]
+    new_shareable = data_store.is_shareable(todo)
 
     todo_start = date.fromisoformat(todo["start_date"])
     todo_end = date.fromisoformat(todo["end_date"])
-    st.caption(f"這筆事項整體區間：{todo_start} ～ {todo_end}")
+    st.caption(
+        f"這筆事項整體區間：{todo_start} ～ {todo_end}　｜　"
+        + ("🔁 可共用" if new_shareable else "不可共用")
+    )
 
-    use_range = st.checkbox("指定一段區間（不勾選的話，預設只有選的那一天生效）", key="dispatch_use_range")
+    # ---- 日期
+    partial = False
+    rec_s = rec_e = None
+    if editing_dispatch:
+        rec_s = _safe_date(editing_dispatch["start_date"]) or todo_start
+        rec_e = _safe_date(editing_dispatch["end_date"]) or rec_s
+        if rec_s < rec_e:
+            mode = st.radio(
+                "修改方式",
+                ["整段一起改（可調整日期與移工）", "只改其中幾天（其餘日期維持原本的移工）"],
+                key=f"dispatch_edit_mode_{edit_key}",
+            )
+            partial = mode.startswith("只改")
 
-    # 日期欄位的 key 帶上事項 id：每筆事項的可選範圍不同，換事項時要重新初始化，
+    # 日期欄位的 key 帶上事項 id 與 edit_key：每筆事項的可選範圍不同，換事項時要重新初始化，
     # 否則上一筆事項選的日期可能超出新事項的範圍而出錯。
-    default_single = min(max(today, todo_start), todo_end)
-    if use_range:
+    if partial:
         c1, c2 = st.columns(2)
-        d_start = c1.date_input("派工開始日期", value=todo_start, min_value=todo_start, max_value=todo_end, key=f"dispatch_range_start_{picked_id}")
-        d_end = c2.date_input("派工結束日期", value=todo_end, min_value=todo_start, max_value=todo_end, key=f"dispatch_range_end_{picked_id}")
+        d_start = c1.date_input("要修改的開始日期", value=rec_s, min_value=rec_s, max_value=rec_e, key=f"dispatch_seg_start_{edit_key}")
+        d_end = c2.date_input("要修改的結束日期", value=rec_e, min_value=rec_s, max_value=rec_e, key=f"dispatch_seg_end_{edit_key}")
     else:
-        d_start = st.date_input("派工日期（只有這一天生效）", value=default_single, min_value=todo_start, max_value=todo_end, key=f"dispatch_single_date_{picked_id}")
-        d_end = d_start
+        default_single = min(max(today, todo_start), todo_end)
+        if editing_dispatch:
+            init_s = min(max(rec_s, todo_start), todo_end)
+            init_e = min(max(rec_e, todo_start), todo_end)
+        else:
+            init_s = init_e = default_single
+        use_range = st.checkbox(
+            "指定一段區間（不勾選的話，預設只有選的那一天生效）",
+            value=bool(editing_dispatch and init_s != init_e),
+            key=f"dispatch_use_range_{edit_key}",
+        )
+        if use_range:
+            c1, c2 = st.columns(2)
+            d_start = c1.date_input("派工開始日期", value=init_s if editing_dispatch else todo_start, min_value=todo_start, max_value=todo_end, key=f"dispatch_range_start_{picked_id}_{edit_key}")
+            d_end = c2.date_input("派工結束日期", value=init_e if editing_dispatch else todo_end, min_value=todo_start, max_value=todo_end, key=f"dispatch_range_end_{picked_id}_{edit_key}")
+        else:
+            d_start = st.date_input("派工日期（只有這一天生效）", value=init_s, min_value=todo_start, max_value=todo_end, key=f"dispatch_single_date_{picked_id}_{edit_key}")
+            d_end = d_start
 
-    completed_ids = {t["id"] for t in all_todos if str(t.get("completed", "")).strip().upper() == "TRUE"}
-    all_dispatches = data_store.get_dispatches()
-    todos_by_id = {t["id"]: t for t in all_todos}
-    busy = _compute_busy_workers_dispatch(all_dispatches, d_start, d_end, completed_todo_ids=completed_ids)
+    # ---- 每位移工在這段期間「已經有的安排」，以及能不能再派給這筆事項
+    assignments = _overlapping_assignments(
+        all_dispatches, todos_by_id, d_start, d_end,
+        exclude_id=editing_dispatch["id"] if editing_dispatch else None,
+    )
+    blocked = {}
+    for w, entries in assignments.items():
+        reason = _block_reason(entries, picked_id, new_shareable)
+        if reason:
+            blocked[w] = reason
 
     worker_options = data_store.get_options("worker")
     if not worker_options:
         st.warning("目前沒有移工選項，請先到「📋 代辦事項」分頁打開「⚙️ 管理選單」新增。")
         return
 
-    with st.form("dispatch_form", clear_on_submit=True):
-        st.markdown("**選擇移工（可複選；灰色代表這段期間已被其他派工佔用）**")
+    if new_shareable:
+        st.caption("🔁 本事項已標記「可共用」：可以指派給已有其他安排的移工。下方會列出他目前的安排，請自己判斷適不適合一起做。")
+    else:
+        st.caption("本事項未標記「可共用」：期間內已被其他「不可共用」事項安排的移工不能選（會列出原因）；他若只有「可共用」的短工項，仍然可以選，下方會列出讓你判斷。若要讓同一位移工兼顧多個獨占工項，請到「📋 代辦事項」把其中一筆改成「可共用」。")
+
+    default_workers = set(data_store.split_workers(editing_dispatch["workers"])) if editing_dispatch else set()
+
+    with st.form("dispatch_form", clear_on_submit=not editing_dispatch):
+        st.markdown("**選擇移工（可複選）**")
         selected = []
         for w in worker_options:
-            is_busy = w in busy
+            entries = assignments.get(w, [])
+            reason = blocked.get(w)
             label = w
-            if is_busy:
-                occ = busy[w]
-                occ_todo = todos_by_id.get(occ["todo_id"])
-                occ_task = occ_todo["task"] if occ_todo else "（事項已刪除）"
-                occ_rng = occ["start_date"] if occ["start_date"] == occ["end_date"] else f"{occ['start_date']}~{occ['end_date']}"
-                label = f"{w}　⚠️ 已指派於「{occ_task}」（{occ_rng}）"
-            checked = st.checkbox(label, value=False, disabled=is_busy, key=f"dispatch_worker_{w}")
+            disabled = False
+            if reason:
+                if w in default_workers:
+                    # 編輯模式：原本就在名單裡、但現在跟其他安排衝突的人，要能取消勾選（換人）
+                    label = f"{w}　⚠️ 與其他安排衝突（{reason}），請取消勾選或調整日期｜已有安排：{_describe_assignments(entries)}"
+                else:
+                    label = f"{w}　⚠️ 無法選擇（{reason}）｜已有安排：{_describe_assignments(entries)}"
+                    disabled = True
+            elif entries:
+                label = f"{w}　🔁 已有安排（可疊加，請確認適合）：{_describe_assignments(entries)}"
+            checked = st.checkbox(label, value=(w in default_workers), disabled=disabled, key=f"dispatch_worker_{edit_key}_{w}")
             if checked:
                 selected.append(w)
 
-        submitted = st.form_submit_button("指派")
+        if editing_dispatch:
+            col_a, col_b = st.columns(2)
+            submitted = col_a.form_submit_button("更新派工", width="stretch")
+            cancel = col_b.form_submit_button("取消編輯", width="stretch")
+        else:
+            submitted = st.form_submit_button("指派")
+            cancel = False
+
+    if cancel:
+        st.session_state.editing_dispatch_id = None
+        st.rerun()
 
     if submitted:
+        conflicts = [w for w in selected if w in blocked]
         if d_end < d_start:
             st.error("結束日期不能早於開始日期")
         elif not selected:
             st.error("請至少選一位移工")
-        elif _is_duplicate_submit(("dispatch", picked_id, str(d_start), str(d_end), tuple(selected))):
-            st.info("偵測到重複送出（10 秒內內容完全相同），已略過，沒有重複指派。")
+        elif conflicts:
+            st.error("這些移工在這段期間與其他安排衝突：" + "、".join(f"{w}（{blocked[w]}）" for w in conflicts))
+        elif _is_duplicate_submit((
+            "dispatch", edit_key, picked_id, str(d_start), str(d_end), tuple(selected), partial,
+        )):
+            st.info("偵測到重複送出（10 秒內內容完全相同），已略過，沒有重複處理。")
         else:
-            with st.spinner("指派中，請稍候…"):
-                record = data_store.add_dispatch(todo["id"], str(d_start), str(d_end), data_store.join_workers(selected))
-            _flash(f"✅ 已指派：{'、'.join(selected)}")
-            _notify_discord_dispatch(todo, record)
+            workers_str = data_store.join_workers(selected)
+            if editing_dispatch:
+                with st.spinner("更新中，請稍候…"):
+                    if partial:
+                        data_store.replace_dispatch_segment(editing_dispatch["id"], str(d_start), str(d_end), workers_str)
+                    else:
+                        data_store.update_dispatch(editing_dispatch["id"], str(d_start), str(d_end), workers_str)
+                st.session_state.editing_dispatch_id = None
+                _flash(f"✅ 已更新派工：{_fmt_range(str(d_start), str(d_end))}　{'、'.join(selected)}")
+                _notify_discord_dispatch_update(todo, editing_dispatch, d_start, d_end, selected, partial)
+            else:
+                with st.spinner("指派中，請稍候…"):
+                    record = data_store.add_dispatch(todo["id"], str(d_start), str(d_end), workers_str)
+                _flash(f"✅ 已指派：{'、'.join(selected)}")
+                _notify_discord_dispatch(todo, record)
             st.rerun()
 
     st.divider()
@@ -455,10 +629,13 @@ def render_dispatch_assignment_tab():
         return
 
     for d in dispatches_for_todo:
-        rng = d["start_date"] if d["start_date"] == d["end_date"] else f"{d['start_date']}~{d['end_date']}"
-        c1, c2 = st.columns([5, 1])
+        rng = _fmt_range(d["start_date"], d["end_date"])
+        c1, c2, c3 = st.columns([5, 1, 1])
         c1.write(f"**{rng}**：{d['workers']}")
-        if c2.button("刪除", key=f"del_dispatch_{d['id']}"):
+        if c2.button("✏️ 編輯", key=f"edit_dispatch_{d['id']}"):
+            st.session_state.editing_dispatch_id = d["id"]
+            st.rerun()
+        if c3.button("刪除", key=f"del_dispatch_{d['id']}"):
             with st.spinner("刪除中…"):
                 data_store.delete_dispatch(d["id"])
             _flash(f"已刪除 {rng} 的派工紀錄")
@@ -510,6 +687,17 @@ def render_dispatch_tab():
     c1.metric("當天派工項目數", len(merged_entries))
     c2.metric("涉及移工人數", len(total_workers))
 
+    # 同一位移工當天同時出現在不只一個工項（共用），特別標出來方便一眼看到
+    worker_tasks = {}
+    for entry in merged_entries:
+        for w in entry["workers"]:
+            worker_tasks.setdefault(w, []).append(entry["todo"]["task"])
+    shared_today = {w: ts for w, ts in worker_tasks.items() if len(ts) > 1}
+    if shared_today:
+        st.info("🔁 當天同時支援多個工項的移工：" + "；".join(
+            f"{w}（{'、'.join(ts)}）" for w, ts in sorted(shared_today.items())
+        ))
+
     if not merged_entries:
         st.info(f"{pick_date} 目前沒有任何派工紀錄。")
     else:
@@ -521,7 +709,7 @@ def render_dispatch_tab():
             workers_text = "、".join(sorted(entry["workers"])) if entry["workers"] else "－"
 
             with st.container(border=True):
-                st.markdown(f"{icon} **{t['task']}**　{'（已完成）' if completed else ''}")
+                st.markdown(f"{icon} **{t['task']}**{'　🔁 可共用' if data_store.is_shareable(t) else ''}{'　（已完成）' if completed else ''}")
                 st.write(f"工項／類型：{t['work_item']}／{t['type']}　　地點：{t.get('location') or '－'}")
                 if t.get("engineer"):
                     st.write(f"指派人：{t['engineer']}")
