@@ -14,6 +14,10 @@ data_store.py
    因為列號位移而改到錯誤的列。
 5. 快取需要真的去讀 Google 的時候，畫面上會顯示「讀取雲端資料中…」讓人知道在處理。
 
+關於「可共用」(shareable)：代辦事項可以標記為「可共用」（例如只需 1 小時或半天就能完成、
+或可以和其他工項共用移工）。派工時，兩筆日期重疊的派工紀錄，只有「雙方的事項都是可共用」
+才允許同一位移工同時出現；只要其中一方不可共用就擋住。
+
 注意：TODO_HEADERS 裡仍保留 "urgency"、"workers" 欄位以維持既有 Google Sheet 的欄位
 結構不被打亂，但這兩個欄位目前都已不使用（緊急程度由 urgency.py 依結束日期即時計算，
 移工改記錄在 Dispatches 分頁）。
@@ -25,7 +29,7 @@ import os
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import gspread
 import requests
@@ -42,7 +46,7 @@ CACHE_TTL_SECONDS = 120
 TODO_HEADERS = [
     "id", "start_date", "end_date", "task", "location", "urgency",
     "work_item", "type", "completed", "created_at", "last_reminder_at",
-    "image_url", "engineer", "workers",
+    "image_url", "engineer", "workers", "shareable",
 ]
 EXP_HEADERS = ["id", "work_item", "source", "details", "mistakes", "created_at"]
 OPTION_HEADERS = ["category", "value"]
@@ -72,6 +76,11 @@ def split_workers(workers_str):
 
 def join_workers(workers_list):
     return WORKERS_SEPARATOR.join(workers_list)
+
+
+def is_shareable(todo):
+    """這筆代辦事項是否標記為「可共用」（舊資料沒有這個欄位，視為不可共用）。"""
+    return str((todo or {}).get("shareable", "")).strip().upper() == "TRUE"
 
 
 # ====================================================================
@@ -279,14 +288,20 @@ def _find_row_index(ws, headers, row_id):
     return None
 
 
-def _find_row(ws, headers, row_id):
-    """一次讀整張表，同時回傳（列號, 該列內容），比分開讀少一次 API 呼叫。"""
+def _find_row_with_total(ws, headers, row_id):
+    """一次讀整張表，回傳（列號, 該列內容, 目前總列數），找不到時列號與內容為 None。"""
     values = ws.get_all_values()
     id_col = headers.index("id")
     for i, row in enumerate(values, start=1):
         if len(row) > id_col and row[id_col] == row_id:
-            return i, row
-    return None, None
+            return i, row, len(values)
+    return None, None, len(values)
+
+
+def _find_row(ws, headers, row_id):
+    """一次讀整張表，同時回傳（列號, 該列內容），比分開讀少一次 API 呼叫。"""
+    idx, row, _ = _find_row_with_total(ws, headers, row_id)
+    return idx, row
 
 
 # ====================================================================
@@ -340,7 +355,7 @@ def get_todos():
 
 @_write_op
 def add_todo(start_date, end_date, task, location, work_item, type_,
-             image_url="", engineer="", workers=""):
+             image_url="", engineer="", workers="", shareable=False):
     """新增代辦事項。緊急程度不由使用者傳入，一律由到期日自動判定。"""
     row = {
         "id": _gen_id("todo"),
@@ -357,6 +372,7 @@ def add_todo(start_date, end_date, task, location, work_item, type_,
         "image_url": image_url,
         "engineer": engineer,
         "workers": workers,
+        "shareable": "TRUE" if shareable else "FALSE",
     }
     _todo_ws().append_row([row[h] for h in TODO_HEADERS])
     get_todos.clear()
@@ -507,6 +523,67 @@ def add_dispatch(todo_id, start_date, end_date, workers):
     _dispatch_ws().append_row([row[h] for h in DISPATCH_HEADERS])
     get_dispatches.clear()
     return row
+
+
+@_write_op
+def update_dispatch(dispatch_id, start_date, end_date, workers):
+    """修改一整筆派工紀錄的日期與移工名單（臨時換人、或調整連續日期的起迄）。"""
+    ws = _dispatch_ws()
+    idx, row_values = _find_row(ws, DISPATCH_HEADERS, dispatch_id)
+    if not idx:
+        raise ValueError(f"找不到 id={dispatch_id} 的派工紀錄（可能已被其他人刪除）")
+    rec = _row_to_dict(DISPATCH_HEADERS, row_values)
+    rec.update(start_date=start_date, end_date=end_date, workers=workers)
+    ws.update(values=[[rec[h] for h in DISPATCH_HEADERS]], range_name=f"A{idx}")
+    get_dispatches.clear()
+    return rec
+
+
+@_write_op
+def replace_dispatch_segment(dispatch_id, seg_start, seg_end, new_workers):
+    """
+    把一筆「連續多天」的派工紀錄中的某一段日期換成別的移工，其餘日期維持原本的移工。
+    例：10/6～10/10 派 A、B，10/8 那天 B 請假要換成 C → 會自動拆成
+        10/6～10/7 A、B ／ 10/8 A、C ／ 10/9～10/10 A、B 共 3 筆。
+    兩個動作（改原本那一列＋新增其餘列）合併成「一次」API 請求送出，
+    這樣遇到 429 自動重試時不會變成改了一半。回傳拆完之後的所有紀錄。
+    """
+    ws = _dispatch_ws()
+    idx, row_values, total_rows = _find_row_with_total(ws, DISPATCH_HEADERS, dispatch_id)
+    if not idx:
+        raise ValueError(f"找不到 id={dispatch_id} 的派工紀錄（可能已被其他人刪除）")
+    rec = _row_to_dict(DISPATCH_HEADERS, row_values)
+
+    s, e = date.fromisoformat(rec["start_date"]), date.fromisoformat(rec["end_date"])
+    a, b = date.fromisoformat(seg_start), date.fromisoformat(seg_end)
+    if not (s <= a <= b <= e):
+        raise ValueError("要修改的日期必須落在這筆派工紀錄的日期範圍內")
+
+    one_day = timedelta(days=1)
+    parts = []  # (起, 迄, 移工)
+    if a > s:
+        parts.append((s, a - one_day, rec["workers"]))
+    parts.append((a, b, new_workers))
+    if b < e:
+        parts.append((b + one_day, e, rec["workers"]))
+
+    # 第一段沿用原本那一列（保留 id 與建立時間），其餘各段新增在表格最後面
+    first = parts[0]
+    result = [dict(rec, start_date=first[0].isoformat(), end_date=first[1].isoformat(), workers=first[2])]
+    data = [{"range": f"A{idx}", "values": [[result[0][h] for h in DISPATCH_HEADERS]]}]
+
+    new_rows = []
+    for ps, pe, pw in parts[1:]:
+        row = {"id": _gen_id("dispatch"), "todo_id": rec["todo_id"], "start_date": ps.isoformat(),
+               "end_date": pe.isoformat(), "workers": pw, "created_at": _now_iso()}
+        result.append(row)
+        new_rows.append([row[h] for h in DISPATCH_HEADERS])
+    if new_rows:
+        data.append({"range": f"A{total_rows + 1}", "values": new_rows})
+
+    ws.batch_update(data)
+    get_dispatches.clear()
+    return result
 
 
 @_write_op
