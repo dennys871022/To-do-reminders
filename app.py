@@ -78,15 +78,20 @@ def _send_discord_async(text):
     threading.Thread(target=_worker, daemon=True).start()
 
 
-def _select_with_add(label, category, key):
+def _select_with_add(label, category, key, current=None):
     """純下拉選單，選項存在 Google Sheets 的 Options 分頁。
     要新增新選項，請到上方「⚙️ 管理工項／類型選單」新增（不能在這個表單裡直接打新選項，
-    因為 Streamlit 表單裡的元件不會即時刷新，體驗上會像打不進去）。"""
-    options = data_store.get_options(category)
+    因為 Streamlit 表單裡的元件不會即時刷新，體驗上會像打不進去）。
+    current：編輯時傳入該事項原本的值，下拉選單會預設選在它；
+    key 呼叫端要帶上事項 id，這樣每次開始編輯都是全新的欄位，不會殘留上一次的選擇。"""
+    options = list(data_store.get_options(category))
+    if current and current not in options:
+        options.append(current)  # 原本的值後來被從選單刪掉了：仍然保留並維持選取，不要悄悄換成別的
     if not options:
         st.warning(f"目前沒有{label}選項，請先到上方「⚙️ 管理選單」新增。")
         return ""
-    return st.selectbox(label, options, key=key)
+    index = options.index(current) if current in options else 0
+    return st.selectbox(label, options, index=index, key=key)
 
 
 def render_option_manager():
@@ -256,6 +261,127 @@ def _notify_discord_dispatch_update(todo, old, new_start, new_end, new_workers, 
         traceback.print_exc()
 
 
+def _fmt_absence(a):
+    reason = f"（{a['reason']}）" if a.get("reason") else ""
+    return f"{_fmt_range(a['start_date'], a['end_date'])}{reason}"
+
+
+def _affected_dispatches(workers, start, end, all_dispatches, todos_by_id):
+    """列出「已經排進去、但落在休假期間」的派工紀錄（只看未完成事項），提醒使用者去換人。"""
+    lines = []
+    workers = set(workers)
+    for d in all_dispatches:
+        t = todos_by_id.get(d["todo_id"])
+        if t is None or _is_done(t):
+            continue
+        if not (d["start_date"] <= end and d["end_date"] >= start):
+            continue
+        hit = workers & set(data_store.split_workers(d.get("workers", "")))
+        for w in sorted(hit):
+            lines.append(f"{w}：「{t['task']}」{_fmt_range(d['start_date'], d['end_date'])}")
+    return lines
+
+
+def _notify_discord_absence(action, workers, start, end, reason):
+    try:
+        lines = [f"🏖️ **移工休假／回國{action}**", f"移工：{'、'.join(workers)}",
+                 f"日期：{_fmt_range(start, end)}"]
+        if reason:
+            lines.append(f"原因：{reason}")
+        lines.append("這段期間無法派工。")
+        _send_discord_async("\n".join(lines))
+    except Exception:
+        traceback.print_exc()
+
+
+def render_absence_manager():
+    """移工預設都有上班；在這裡登記某位移工某段日期休息或回國，之後那段期間不能派工。可編輯、可刪除。"""
+    absences = data_store.get_absences()
+    today_s = datetime_now_taipei_date().isoformat()
+
+    editing = None
+    eid = st.session_state.get("editing_absence_id")
+    if eid:
+        editing = next((a for a in absences if a["id"] == eid), None)
+        if editing is None:  # 已被別人刪除
+            st.session_state.editing_absence_id = None
+    ekey = editing["id"] if editing else "new"
+
+    current = sorted([a for a in absences if a["end_date"] >= today_s], key=lambda a: (a["start_date"], a["worker"]))
+    past = sorted([a for a in absences if a["end_date"] < today_s], key=lambda a: a["start_date"], reverse=True)
+
+    with st.expander(f"🏖️ 移工休假／回國登記（目前有效 {len(current)} 筆）", expanded=bool(editing)):
+        st.caption("移工預設都有上班。登記後，該移工在這段日期內（含頭尾）無法被派工；日後行程有變可以編輯或刪除。")
+        worker_options = data_store.get_options("worker")
+        today = datetime_now_taipei_date()
+
+        with st.form("absence_form", clear_on_submit=not editing):
+            if editing:
+                opts = list(worker_options)
+                if editing["worker"] not in opts:
+                    opts.append(editing["worker"])
+                picked_workers = [st.selectbox("移工", opts, index=opts.index(editing["worker"]), key=f"absence_worker_{ekey}")]
+            else:
+                picked_workers = st.multiselect("移工（可複選，同一段日期一次登記多位）", worker_options, key=f"absence_workers_{ekey}")
+            c1, c2 = st.columns(2)
+            a_start = c1.date_input("休假開始日期", value=_safe_date(editing["start_date"]) or today if editing else today, key=f"absence_start_{ekey}")
+            a_end = c2.date_input("休假結束日期（含當天）", value=_safe_date(editing["end_date"]) or today if editing else today, key=f"absence_end_{ekey}")
+            reason = st.text_input("原因（選填，例如：休假、回國、就醫）", value=editing.get("reason", "") if editing else "", key=f"absence_reason_{ekey}")
+            if editing:
+                b1, b2 = st.columns(2)
+                absence_submit = b1.form_submit_button("更新休假", width="stretch")
+                absence_cancel = b2.form_submit_button("取消編輯", width="stretch")
+            else:
+                absence_submit = st.form_submit_button("登記休假")
+                absence_cancel = False
+
+        if absence_cancel:
+            st.session_state.editing_absence_id = None
+            st.rerun()
+
+        if absence_submit:
+            if not picked_workers:
+                st.error("請至少選一位移工")
+            elif a_end < a_start:
+                st.error("結束日期不能早於開始日期")
+            elif _is_duplicate_submit(("absence", ekey, tuple(picked_workers), str(a_start), str(a_end), reason.strip())):
+                st.info("偵測到重複送出（10 秒內內容完全相同），已略過，沒有重複儲存。")
+            else:
+                with st.spinner("儲存中，請稍候…"):
+                    if editing:
+                        data_store.update_absence(editing["id"], picked_workers[0], str(a_start), str(a_end), reason.strip())
+                    else:
+                        data_store.add_absences(picked_workers, str(a_start), str(a_end), reason.strip())
+                todos_by_id = {t["id"]: t for t in data_store.get_todos()}
+                affected = _affected_dispatches(picked_workers, str(a_start), str(a_end), data_store.get_dispatches(), todos_by_id)
+                msg = f"✅ 已{'更新' if editing else '登記'}休假：{'、'.join(picked_workers)}　{_fmt_range(str(a_start), str(a_end))}"
+                if affected:
+                    msg += "\n\n⚠️ 以下已排好的派工落在休假期間，請到下方「派工紀錄」編輯換人：\n" + "\n".join(f"・{x}" for x in affected)
+                st.session_state.editing_absence_id = None
+                _flash(msg)
+                _notify_discord_absence("更新" if editing else "登記", picked_workers, str(a_start), str(a_end), reason.strip())
+                st.rerun()
+
+        st.markdown("**目前有效的休假紀錄**")
+        if not current:
+            st.caption("目前沒有任何休假登記，所有移工都可以派工。")
+        for a in current:
+            r1, r2, r3 = st.columns([5, 1, 1])
+            r1.write(f"**{a['worker']}**　{_fmt_absence(a)}")
+            if r2.button("✏️ 編輯", key=f"edit_absence_{a['id']}"):
+                st.session_state.editing_absence_id = a["id"]
+                st.rerun()
+            if r3.button("刪除", key=f"del_absence_{a['id']}"):
+                with st.spinner("刪除中…"):
+                    data_store.delete_absence(a["id"])
+                _flash(f"已刪除 {a['worker']} {_fmt_range(a['start_date'], a['end_date'])} 的休假登記")
+                st.rerun()
+
+        if past and st.toggle(f"顯示已結束的休假紀錄（{len(past)} 筆）", key="show_past_absences"):
+            for a in past:
+                st.caption(f"{a['worker']}　{_fmt_absence(a)}")
+
+
 def render_todo_tab():
     if st.toggle("⚙️ 管理選單（工項／類型／工程師／移工）", key="show_option_manager"):
         render_option_manager()
@@ -287,9 +413,14 @@ def render_todo_tab():
             "地點（例如：B1停車場、3樓東側）", value=editing["location"] if editing else ""
         )
 
-        work_item = _select_with_add("工項", "work_item", "work_item_select")
-        type_ = _select_with_add("類型", "type", "type_select")
-        engineer = _select_with_add("指派人（工程師）", "engineer", "engineer_select")
+        ekey = editing["id"] if editing else "new"
+        work_item = _select_with_add(
+            "工項", "work_item", f"work_item_select_{ekey}", current=editing["work_item"] if editing else None)
+        type_ = _select_with_add(
+            "類型", "type", f"type_select_{ekey}", current=editing["type"] if editing else None)
+        engineer = _select_with_add(
+            "指派人（工程師）", "engineer", f"engineer_select_{ekey}",
+            current=(editing.get("engineer") or None) if editing else None)
 
         shareable = st.checkbox(
             "🔁 可共用（此工項可以與其他工項共用移工，例如只需 1 小時或半天就能完成）",
@@ -431,6 +562,8 @@ def render_todo_tab():
 def render_dispatch_assignment_tab():
     st.subheader("👷 移工指派")
 
+    render_absence_manager()
+
     all_todos = data_store.get_todos()
     active_todos = [t for t in all_todos if not _is_done(t)]
 
@@ -555,6 +688,9 @@ def render_dispatch_assignment_tab():
 
     default_workers = set(data_store.split_workers(editing_dispatch["workers"])) if editing_dispatch else set()
 
+    # 這段派工日期內有登記休假／回國的移工（有任何一天重疊就不能派）
+    absent = data_store.absent_workers_on(data_store.get_absences(), str(d_start), str(d_end))
+
     with st.form("dispatch_form", clear_on_submit=not editing_dispatch):
         st.markdown("**選擇移工（可複選）**")
         selected = []
@@ -563,7 +699,15 @@ def render_dispatch_assignment_tab():
             reason = blocked.get(w)
             label = w
             disabled = False
-            if reason:
+            ab = absent.get(w)
+            if ab:
+                why = "；".join(_fmt_absence(a) for a in ab)
+                if w in default_workers:
+                    label = f"{w}　🏖️ 這段期間休假／回國（{why}），請取消勾選、換人或調整日期"
+                else:
+                    label = f"{w}　🏖️ 休假／回國，無法派工（{why}）"
+                    disabled = True
+            elif reason:
                 if w in default_workers:
                     # 編輯模式：原本就在名單裡、但現在跟其他安排衝突的人，要能取消勾選（換人）
                     label = f"{w}　⚠️ 與其他安排衝突（{reason}），請取消勾選或調整日期｜已有安排：{_describe_assignments(entries)}"
@@ -589,11 +733,15 @@ def render_dispatch_assignment_tab():
         st.rerun()
 
     if submitted:
-        conflicts = [w for w in selected if w in blocked]
+        conflicts = [w for w in selected if w in blocked and w not in absent]
+        absent_picked = [w for w in selected if w in absent]
         if d_end < d_start:
             st.error("結束日期不能早於開始日期")
         elif not selected:
             st.error("請至少選一位移工")
+        elif absent_picked:
+            st.error("這些移工在這段期間休假／回國，無法派工：" + "、".join(
+                f"{w}（{'；'.join(_fmt_absence(a) for a in absent[w])}）" for w in absent_picked))
         elif conflicts:
             st.error("這些移工在這段期間與其他安排衝突：" + "、".join(f"{w}（{blocked[w]}）" for w in conflicts))
         elif _is_duplicate_submit((
@@ -682,6 +830,14 @@ def render_dispatch_tab():
     total_workers = set()
     for entry in merged_entries:
         total_workers.update(entry["workers"])
+
+    day_absent = data_store.absent_workers_on(data_store.get_absences(), str(pick_date), str(pick_date))
+    if day_absent:
+        st.info("🏖️ 當天休假／回國：" + "；".join(
+            f"{w}（{'；'.join(_fmt_absence(a) for a in ab)}）" for w, ab in sorted(day_absent.items())))
+        scheduled_absent = sorted(w for w in total_workers if w in day_absent)
+        if scheduled_absent:
+            st.warning("⚠️ 以下移工當天已被排進派工、但登記為休假／回國，請到「👷 移工指派」換人：" + "、".join(scheduled_absent))
 
     c1, c2 = st.columns(2)
     c1.metric("當天派工項目數", len(merged_entries))
