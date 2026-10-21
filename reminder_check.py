@@ -112,6 +112,18 @@ def _build_full_report(active_todos, today, test_mode=False):
     head = "【測試】" if test_mode else ""
     lines = [f"{head}**【代辦提醒】共 {total} 筆事項需要注意**"]
 
+    try:
+        absent_today = data_store.absent_workers_on(data_store.get_absences(), str(today), str(today))
+    except Exception as e:  # 休假資料讀不到不影響晨報
+        print(f"讀取休假登記失敗（略過）：{e}")
+        absent_today = {}
+    if absent_today:
+        lines.append("")
+        lines.append("🏖️ **今日休假／回國：** " + "、".join(sorted(absent_today)))
+        clash = sorted({w for _, _, ws in dispatched for w in ws if w in absent_today})
+        if clash:
+            lines.append("⚠️ 以下移工今日已被排班但登記休假，請換人：" + "、".join(clash))
+
     if dispatched:
         dispatched.sort(
             key=lambda x: urgency.TIER_ORDER.index(x[0]) if x[0] in urgency.TIER_ORDER else len(urgency.TIER_ORDER)
