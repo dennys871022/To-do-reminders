@@ -51,6 +51,8 @@ TODO_HEADERS = [
 EXP_HEADERS = ["id", "work_item", "source", "details", "mistakes", "created_at"]
 OPTION_HEADERS = ["category", "value"]
 DISPATCH_HEADERS = ["id", "todo_id", "start_date", "end_date", "workers", "created_at"]
+# 移工休假／回國：一筆紀錄＝一位移工在某段日期（含頭尾）不能派工
+ABSENCE_HEADERS = ["id", "worker", "start_date", "end_date", "reason", "created_at"]
 
 # 移工名單用「、」分隔存成一個字串（一筆派工紀錄可能同時指派多位移工）
 WORKERS_SEPARATOR = "、"
@@ -260,6 +262,12 @@ def _option_ws():
 @_read_op
 def _dispatch_ws():
     return _get_or_create_worksheet(_open_spreadsheet(), "Dispatches", DISPATCH_HEADERS)
+
+
+@_cache_resource(ttl=300)
+@_read_op
+def _absence_ws():
+    return _get_or_create_worksheet(_open_spreadsheet(), "WorkerAbsences", ABSENCE_HEADERS)
 
 
 # ====================================================================
@@ -596,13 +604,70 @@ def delete_dispatch(dispatch_id):
 
 
 # ====================================================================
+# 移工休假／回國（WorkerAbsences）
+# 預設所有移工都有上班；有登記的日期區間內，該移工不能被派工。
+# ====================================================================
+
+@_cache_data()
+@_read_op
+def get_absences():
+    return _absence_ws().get_all_records(expected_headers=ABSENCE_HEADERS)
+
+
+def absent_workers_on(absences, start_date, end_date):
+    """回傳 {移工: [與 start~end 重疊的休假紀錄, ...]}（日期為 ISO 字串）。"""
+    result = {}
+    for a in absences:
+        if a["start_date"] <= end_date and a["end_date"] >= start_date:
+            result.setdefault(a["worker"], []).append(a)
+    return result
+
+
+@_write_op
+def add_absences(workers, start_date, end_date, reason=""):
+    """一次替多位移工登記同一段休假，用一次 API 請求寫入。"""
+    rows = []
+    for w in workers:
+        rows.append({
+            "id": _gen_id("absence"), "worker": w, "start_date": start_date,
+            "end_date": end_date, "reason": reason, "created_at": _now_iso(),
+        })
+    if rows:
+        _absence_ws().append_rows([[r[h] for h in ABSENCE_HEADERS] for r in rows])
+        get_absences.clear()
+    return rows
+
+
+@_write_op
+def update_absence(absence_id, worker, start_date, end_date, reason=""):
+    ws = _absence_ws()
+    idx, row_values = _find_row(ws, ABSENCE_HEADERS, absence_id)
+    if not idx:
+        raise ValueError(f"找不到 id={absence_id} 的休假紀錄（可能已被其他人刪除）")
+    rec = _row_to_dict(ABSENCE_HEADERS, row_values)
+    rec.update(worker=worker, start_date=start_date, end_date=end_date, reason=reason)
+    ws.update(values=[[rec[h] for h in ABSENCE_HEADERS]], range_name=f"A{idx}")
+    get_absences.clear()
+    return rec
+
+
+@_write_op
+def delete_absence(absence_id):
+    ws = _absence_ws()
+    idx = _find_row_index(ws, ABSENCE_HEADERS, absence_id)
+    if idx:
+        ws.delete_rows(idx)
+    get_absences.clear()
+
+
+# ====================================================================
 # 一鍵清除所有快取（App 上的「重新整理」按鈕用）
 # ====================================================================
 
 def clear_all_caches():
-    for fn in (get_todos, get_dispatches, get_experiences, get_all_options):
+    for fn in (get_todos, get_dispatches, get_experiences, get_all_options, get_absences):
         fn.clear()
-    for fn in (_todo_ws, _exp_ws, _option_ws, _dispatch_ws, _open_spreadsheet):
+    for fn in (_todo_ws, _exp_ws, _option_ws, _dispatch_ws, _absence_ws, _open_spreadsheet):
         clear = getattr(fn, "clear", None)
         if clear:
             clear()
