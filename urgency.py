@@ -52,9 +52,22 @@ def classify_tier(end_date_str, today=None):
         return None
 
 
+def overdue_days(end_date_str, today=None):
+    """已逾期幾天（結束日期早於今天才算）；沒逾期或日期格式錯誤回傳 0。"""
+    if today is None:
+        today = date.today()
+    try:
+        n = (today - date.fromisoformat(end_date_str)).days
+    except (ValueError, TypeError):
+        return 0
+    return n if n > 0 else 0
+
+
 def tier_label(end_date_str, today=None):
-    """回傳給畫面顯示用的文字，例如「🔴 非常緊急」；超出範圍回傳「⚪ 尚未進入提醒範圍」。"""
+    """回傳給畫面顯示用的文字，例如「🔴 非常緊急」；已逾期會附上天數；超出範圍回傳「⚪ 尚未進入提醒範圍」。"""
     tier = classify_tier(end_date_str, today)
     if tier is None:
         return "⚪ 尚未進入提醒範圍"
-    return f"{TIER_ICONS[tier]} {tier}"
+    late = overdue_days(end_date_str, today)
+    suffix = f"（已逾期 {late} 天）" if late else ""
+    return f"{TIER_ICONS[tier]} {tier}{suffix}"
