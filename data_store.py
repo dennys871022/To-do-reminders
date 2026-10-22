@@ -52,7 +52,12 @@ EXP_HEADERS = ["id", "work_item", "source", "details", "mistakes", "created_at"]
 OPTION_HEADERS = ["category", "value"]
 DISPATCH_HEADERS = ["id", "todo_id", "start_date", "end_date", "workers", "created_at"]
 # 移工休假／回國：一筆紀錄＝一位移工在某段日期（含頭尾）不能派工
-ABSENCE_HEADERS = ["id", "worker", "start_date", "end_date", "reason", "created_at"]
+# weekdays：空白＝連續休假（start~end 每一天都休）；填 "6" 或 "5,6"（週一=0 … 週日=6）＝在 start~end
+# 這段期間內「每週固定」這幾天休（例如每週日休）。
+ABSENCE_HEADERS = ["id", "worker", "start_date", "end_date", "reason", "created_at", "weekdays"]
+# 操作紀錄：誰、什麼時候、做了什麼（台灣時間存成字串，方便直接在試算表閱讀）
+AUDIT_HEADERS = ["time", "operator", "action", "target", "detail"]
+ARCHIVE_SUFFIX = "_Archive"
 
 # 移工名單用「、」分隔存成一個字串（一筆派工紀錄可能同時指派多位移工）
 WORKERS_SEPARATOR = "、"
@@ -268,6 +273,24 @@ def _dispatch_ws():
 @_read_op
 def _absence_ws():
     return _get_or_create_worksheet(_open_spreadsheet(), "WorkerAbsences", ABSENCE_HEADERS)
+
+
+@_cache_resource(ttl=300)
+@_read_op
+def _audit_ws():
+    return _get_or_create_worksheet(_open_spreadsheet(), "AuditLog", AUDIT_HEADERS)
+
+
+@_cache_resource(ttl=300)
+@_read_op
+def _todo_archive_ws():
+    return _get_or_create_worksheet(_open_spreadsheet(), "Todos" + ARCHIVE_SUFFIX, TODO_HEADERS)
+
+
+@_cache_resource(ttl=300)
+@_read_op
+def _dispatch_archive_ws():
+    return _get_or_create_worksheet(_open_spreadsheet(), "Dispatches" + ARCHIVE_SUFFIX, DISPATCH_HEADERS)
 
 
 # ====================================================================
@@ -614,23 +637,58 @@ def get_absences():
     return _absence_ws().get_all_records(expected_headers=ABSENCE_HEADERS)
 
 
+def parse_weekdays(value):
+    """"5,6" → {5, 6}；空白或格式不對 → 空集合（代表不是每週固定型）。"""
+    out = set()
+    for x in str(value or "").replace("、", ",").split(","):
+        x = x.strip()
+        if x.isdigit() and 0 <= int(x) <= 6:
+            out.add(int(x))
+    return out
+
+
+WEEKDAY_NAMES = ["一", "二", "三", "四", "五", "六", "日"]
+
+
+def absence_hits(a, start_date, end_date):
+    """這筆休假紀錄是否讓該移工在 [start_date, end_date]（ISO 字串）內至少有一天不能派工。"""
+    lo, hi = max(a["start_date"], start_date), min(a["end_date"], end_date)
+    if lo > hi:
+        return False
+    wd = parse_weekdays(a.get("weekdays"))
+    if not wd:
+        return True
+    d, last = date.fromisoformat(lo), date.fromisoformat(hi)
+    for _ in range(366):  # 最多檢查一年；每週固定型只要涵蓋 7 天一定會命中
+        if d > last:
+            break
+        if d.weekday() in wd:
+            return True
+        d += timedelta(days=1)
+    return False
+
+
 def absent_workers_on(absences, start_date, end_date):
-    """回傳 {移工: [與 start~end 重疊的休假紀錄, ...]}（日期為 ISO 字串）。"""
+    """回傳 {移工: [讓他在 start~end 內無法派工的休假紀錄, ...]}（日期為 ISO 字串）。"""
     result = {}
     for a in absences:
-        if a["start_date"] <= end_date and a["end_date"] >= start_date:
-            result.setdefault(a["worker"], []).append(a)
+        try:
+            if absence_hits(a, start_date, end_date):
+                result.setdefault(a["worker"], []).append(a)
+        except (ValueError, TypeError):
+            continue
     return result
 
 
 @_write_op
-def add_absences(workers, start_date, end_date, reason=""):
+def add_absences(workers, start_date, end_date, reason="", weekdays=""):
     """一次替多位移工登記同一段休假，用一次 API 請求寫入。"""
     rows = []
     for w in workers:
         rows.append({
             "id": _gen_id("absence"), "worker": w, "start_date": start_date,
             "end_date": end_date, "reason": reason, "created_at": _now_iso(),
+            "weekdays": weekdays,
         })
     if rows:
         _absence_ws().append_rows([[r[h] for h in ABSENCE_HEADERS] for r in rows])
@@ -639,13 +697,13 @@ def add_absences(workers, start_date, end_date, reason=""):
 
 
 @_write_op
-def update_absence(absence_id, worker, start_date, end_date, reason=""):
+def update_absence(absence_id, worker, start_date, end_date, reason="", weekdays=""):
     ws = _absence_ws()
     idx, row_values = _find_row(ws, ABSENCE_HEADERS, absence_id)
     if not idx:
         raise ValueError(f"找不到 id={absence_id} 的休假紀錄（可能已被其他人刪除）")
     rec = _row_to_dict(ABSENCE_HEADERS, row_values)
-    rec.update(worker=worker, start_date=start_date, end_date=end_date, reason=reason)
+    rec.update(worker=worker, start_date=start_date, end_date=end_date, reason=reason, weekdays=weekdays)
     ws.update(values=[[rec[h] for h in ABSENCE_HEADERS]], range_name=f"A{idx}")
     get_absences.clear()
     return rec
@@ -660,14 +718,109 @@ def delete_absence(absence_id):
     get_absences.clear()
 
 
+@_write_op
+def add_dispatches(records):
+    """一次新增多筆派工紀錄（複製派工用）。records: [(todo_id, start, end, workers_str), ...]"""
+    rows = [{
+        "id": _gen_id("dispatch"), "todo_id": tid, "start_date": s_, "end_date": e_,
+        "workers": w, "created_at": _now_iso(),
+    } for tid, s_, e_, w in records]
+    if rows:
+        _dispatch_ws().append_rows([[r[h] for h in DISPATCH_HEADERS] for r in rows])
+        get_dispatches.clear()
+    return rows
+
+
+# ====================================================================
+# 操作紀錄（AuditLog）：誰在什麼時候做了什麼。寫入失敗絕不影響主要操作。
+# ====================================================================
+
+def log_action(operator, action, target="", detail=""):
+    try:
+        now_local = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+        with _WRITE_LOCK:
+            _audit_ws().append_row([now_local, operator or "（未具名）", action, target, detail])
+        get_audit_log.clear()
+    except Exception as e:  # 紀錄只是輔助，不能讓使用者的存檔失敗
+        print(f"操作紀錄寫入失敗（略過）：{e}")
+
+
+@_cache_data(ttl=60)
+@_read_op
+def get_audit_log():
+    return _audit_ws().get_all_records(expected_headers=AUDIT_HEADERS)
+
+
+# ====================================================================
+# 封存與備份
+# ====================================================================
+
+@_cache_data()
+@_read_op
+def get_archived_todos():
+    return _todo_archive_ws().get_all_records(expected_headers=TODO_HEADERS)
+
+
+@_cache_data()
+@_read_op
+def get_archived_dispatches():
+    return _dispatch_archive_ws().get_all_records(expected_headers=DISPATCH_HEADERS)
+
+
+def _move_rows_to_archive(ws, headers, archive_ws, ids_to_move):
+    """把 ws 裡 id 在 ids_to_move 的列搬到封存分頁。順序刻意是：
+    ① 先把要封存的列「複製」進封存分頁 → ② 用剩下的列覆蓋主表上半部 → ③ 清掉多出來的尾巴。
+    萬一中途失敗，最糟只是資料同時存在兩邊（重複），不會遺失任何一筆。"""
+    values = ws.get_all_values()
+    if len(values) <= 1:
+        return 0
+    id_col = headers.index("id")
+    keep, move = [], []
+    for row in values[1:]:
+        (move if len(row) > id_col and row[id_col] in ids_to_move else keep).append(row)
+    if not move:
+        return 0
+    width = len(headers)
+    pad = lambda r: (list(r) + [""] * width)[:width]
+    archive_ws.append_rows([pad(r) for r in move])
+    if keep:
+        ws.update(values=[pad(r) for r in keep], range_name="A2")
+    old_last = len(values)
+    new_last = 1 + len(keep)
+    if old_last > new_last:
+        ws.batch_clear([f"A{new_last + 1}:{chr(ord('A') + width - 1)}{old_last}"])
+    return len(move)
+
+
+@_write_op
+def archive_completed_before(cutoff_date_iso):
+    """把「已完成、且結束日期早於 cutoff」的事項（連同它們的派工紀錄）搬到封存分頁。回傳搬走的事項數。"""
+    todos = get_todos()
+    ids = {t["id"] for t in todos
+           if str(t.get("completed", "")).strip().upper() == "TRUE"
+           and t.get("end_date") and t["end_date"] < cutoff_date_iso}
+    if not ids:
+        return 0
+    n = _move_rows_to_archive(_todo_ws(), TODO_HEADERS, _todo_archive_ws(), ids)
+    _move_rows_to_archive(
+        _dispatch_ws(), DISPATCH_HEADERS, _dispatch_archive_ws(),
+        {d["id"] for d in get_dispatches() if d["todo_id"] in ids},
+    )
+    for fn in (get_todos, get_dispatches, get_archived_todos, get_archived_dispatches):
+        fn.clear()
+    return n
+
+
 # ====================================================================
 # 一鍵清除所有快取（App 上的「重新整理」按鈕用）
 # ====================================================================
 
 def clear_all_caches():
-    for fn in (get_todos, get_dispatches, get_experiences, get_all_options, get_absences):
+    for fn in (get_todos, get_dispatches, get_experiences, get_all_options, get_absences,
+               get_audit_log, get_archived_todos, get_archived_dispatches):
         fn.clear()
-    for fn in (_todo_ws, _exp_ws, _option_ws, _dispatch_ws, _absence_ws, _open_spreadsheet):
+    for fn in (_todo_ws, _exp_ws, _option_ws, _dispatch_ws, _absence_ws, _audit_ws,
+               _todo_archive_ws, _dispatch_archive_ws, _open_spreadsheet):
         clear = getattr(fn, "clear", None)
         if clear:
             clear()
