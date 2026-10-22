@@ -18,7 +18,7 @@ import traceback
 
 import streamlit as st
 import pandas as pd
-from datetime import date
+from datetime import date, timedelta
 from zoneinfo import ZoneInfo
 
 import data_store
@@ -33,6 +33,37 @@ TZ = ZoneInfo("Asia/Taipei")
 def _init_state():
     if "editing_id" not in st.session_state:
         st.session_state.editing_id = None
+    if "operator" not in st.session_state:
+        # 操作人姓名記在網址參數 ?user=xxx 裡：加書籤／下次從同一個網址進來就不用再選
+        st.session_state.operator = str(st.query_params.get("user", "")).strip()
+
+
+def _audit(action, target="", detail=""):
+    """寫一筆操作紀錄（誰、做了什麼）。失敗不影響主要操作。"""
+    data_store.log_action(st.session_state.get("operator", ""), action, target, detail)
+
+
+def _render_operator_gate():
+    """還沒選姓名就先請他選（不是登入密碼，只是用來記錄「誰操作的」）。回傳是否可以繼續。"""
+    if st.session_state.operator:
+        return True
+    st.subheader("👤 請先選擇你的姓名")
+    st.caption("系統會記錄每次新增、修改是誰操作的（這不是登入密碼）。選好後會記在網址裡，把網址加入書籤，下次就不用再選。")
+    names = data_store.get_options("engineer")
+    other_label = "➕ 其他（請在下方輸入）"
+    with st.form("operator_form"):
+        picked = st.selectbox("姓名", names + [other_label])
+        other = st.text_input("其他姓名（上面選「其他」時才需要填）")
+        go = st.form_submit_button("開始使用")
+    if go:
+        name = other.strip() if picked == other_label else picked
+        if not name:
+            st.error("請輸入姓名")
+        else:
+            st.session_state.operator = name
+            st.query_params["user"] = name
+            st.rerun()
+    return False
 
 
 def _flash(message):
@@ -63,6 +94,9 @@ def _is_duplicate_submit(token, window_seconds=10):
 def _send_discord_async(text):
     """在背景發送 Discord 訊息，不讓使用者等它；失敗時記錄起來，下次畫面更新時提醒。"""
     errors = st.session_state.setdefault("_notify_errors", [])
+    op = st.session_state.get("operator")
+    if op:
+        text = f"{text}\n👤 操作人：{op}"
     try:
         webhook_url = discord_notify._get_webhook_url()  # 在主執行緒先取好，背景執行緒不碰 st
     except Exception as e:
@@ -112,6 +146,7 @@ def _render_option_column(category, label):
         if c2.button("🗑", key=f"del_{category}_{v}"):
             with st.spinner("刪除中…"):
                 data_store.delete_option(category, v)
+            _audit("刪除選項", f"{label}：{v}")
             st.rerun()
     with st.form(f"add_{category}_form", clear_on_submit=True):
         c1, c2 = st.columns([4, 1])
@@ -120,6 +155,7 @@ def _render_option_column(category, label):
             if new_val.strip():
                 with st.spinner("新增中…"):
                     data_store.add_option(category, new_val.strip())
+                _audit("新增選項", f"{label}：{new_val.strip()}")
                 st.rerun()
     st.divider()
 
@@ -263,10 +299,12 @@ def _notify_discord_dispatch_update(todo, old, new_start, new_end, new_workers, 
 
 def _fmt_absence(a):
     reason = f"（{a['reason']}）" if a.get("reason") else ""
-    return f"{_fmt_range(a['start_date'], a['end_date'])}{reason}"
+    wd = data_store.parse_weekdays(a.get("weekdays"))
+    weekly = "　每週" + "、".join(data_store.WEEKDAY_NAMES[i] for i in sorted(wd)) + "固定休" if wd else ""
+    return f"{_fmt_range(a['start_date'], a['end_date'])}{weekly}{reason}"
 
 
-def _affected_dispatches(workers, start, end, all_dispatches, todos_by_id):
+def _affected_dispatches(workers, start, end, weekdays, all_dispatches, todos_by_id):
     """列出「已經排進去、但落在休假期間」的派工紀錄（只看未完成事項），提醒使用者去換人。"""
     lines = []
     workers = set(workers)
@@ -274,7 +312,8 @@ def _affected_dispatches(workers, start, end, all_dispatches, todos_by_id):
         t = todos_by_id.get(d["todo_id"])
         if t is None or _is_done(t):
             continue
-        if not (d["start_date"] <= end and d["end_date"] >= start):
+        rule = {"start_date": start, "end_date": end, "weekdays": weekdays}
+        if not data_store.absence_hits(rule, d["start_date"], d["end_date"]):
             continue
         hit = workers & set(data_store.split_workers(d.get("workers", "")))
         for w in sorted(hit):
@@ -282,10 +321,10 @@ def _affected_dispatches(workers, start, end, all_dispatches, todos_by_id):
     return lines
 
 
-def _notify_discord_absence(action, workers, start, end, reason):
+def _notify_discord_absence(action, workers, start, end, reason, weekdays=""):
     try:
         lines = [f"🏖️ **移工休假／回國{action}**", f"移工：{'、'.join(workers)}",
-                 f"日期：{_fmt_range(start, end)}"]
+                 f"日期：{_fmt_absence({'start_date': start, 'end_date': end, 'reason': '', 'weekdays': weekdays})}"]
         if reason:
             lines.append(f"原因：{reason}")
         lines.append("這段期間無法派工。")
@@ -326,6 +365,12 @@ def render_absence_manager():
             c1, c2 = st.columns(2)
             a_start = c1.date_input("休假開始日期", value=_safe_date(editing["start_date"]) or today if editing else today, key=f"absence_start_{ekey}")
             a_end = c2.date_input("休假結束日期（含當天）", value=_safe_date(editing["end_date"]) or today if editing else today, key=f"absence_end_{ekey}")
+            wd_names = data_store.WEEKDAY_NAMES
+            wd_default = [wd_names[i] for i in sorted(data_store.parse_weekdays(editing.get("weekdays")))] if editing else []
+            weekly_days = st.multiselect(
+                "每週固定休（選填）", wd_names, default=wd_default, key=f"absence_weekly_{ekey}",
+                help="不選＝上面日期區間內每一天都休。選了（例如「日」）＝只在這個日期區間內的每週日休。",
+            )
             reason = st.text_input("原因（選填，例如：休假、回國、就醫）", value=editing.get("reason", "") if editing else "", key=f"absence_reason_{ekey}")
             if editing:
                 b1, b2 = st.columns(2)
@@ -344,22 +389,25 @@ def render_absence_manager():
                 st.error("請至少選一位移工")
             elif a_end < a_start:
                 st.error("結束日期不能早於開始日期")
-            elif _is_duplicate_submit(("absence", ekey, tuple(picked_workers), str(a_start), str(a_end), reason.strip())):
+            elif _is_duplicate_submit(("absence", ekey, tuple(picked_workers), str(a_start), str(a_end), reason.strip(), tuple(weekly_days))):
                 st.info("偵測到重複送出（10 秒內內容完全相同），已略過，沒有重複儲存。")
             else:
+                wd_str = ",".join(str(wd_names.index(x)) for x in weekly_days)
                 with st.spinner("儲存中，請稍候…"):
                     if editing:
-                        data_store.update_absence(editing["id"], picked_workers[0], str(a_start), str(a_end), reason.strip())
+                        data_store.update_absence(editing["id"], picked_workers[0], str(a_start), str(a_end), reason.strip(), wd_str)
                     else:
-                        data_store.add_absences(picked_workers, str(a_start), str(a_end), reason.strip())
+                        data_store.add_absences(picked_workers, str(a_start), str(a_end), reason.strip(), wd_str)
                 todos_by_id = {t["id"]: t for t in data_store.get_todos()}
-                affected = _affected_dispatches(picked_workers, str(a_start), str(a_end), data_store.get_dispatches(), todos_by_id)
+                affected = _affected_dispatches(picked_workers, str(a_start), str(a_end), wd_str, data_store.get_dispatches(), todos_by_id)
+                _audit("更新休假" if editing else "登記休假", "、".join(picked_workers),
+                       _fmt_absence({"start_date": str(a_start), "end_date": str(a_end), "reason": reason.strip(), "weekdays": wd_str}))
                 msg = f"✅ 已{'更新' if editing else '登記'}休假：{'、'.join(picked_workers)}　{_fmt_range(str(a_start), str(a_end))}"
                 if affected:
                     msg += "\n\n⚠️ 以下已排好的派工落在休假期間，請到下方「派工紀錄」編輯換人：\n" + "\n".join(f"・{x}" for x in affected)
                 st.session_state.editing_absence_id = None
                 _flash(msg)
-                _notify_discord_absence("更新" if editing else "登記", picked_workers, str(a_start), str(a_end), reason.strip())
+                _notify_discord_absence("更新" if editing else "登記", picked_workers, str(a_start), str(a_end), reason.strip(), wd_str)
                 st.rerun()
 
         st.markdown("**目前有效的休假紀錄**")
@@ -374,12 +422,43 @@ def render_absence_manager():
             if r3.button("刪除", key=f"del_absence_{a['id']}"):
                 with st.spinner("刪除中…"):
                     data_store.delete_absence(a["id"])
+                _audit("刪除休假", a["worker"], _fmt_absence(a))
                 _flash(f"已刪除 {a['worker']} {_fmt_range(a['start_date'], a['end_date'])} 的休假登記")
                 st.rerun()
 
         if past and st.toggle(f"顯示已結束的休假紀錄（{len(past)} 筆）", key="show_past_absences"):
             for a in past:
                 st.caption(f"{a['worker']}　{_fmt_absence(a)}")
+
+
+def _render_complete_form(t):
+    """標記完成前，順手留下這次的經驗（可留白，直接完成）。有寫的話會自動存進「經驗分享區」。"""
+    with st.form(f"complete_form_{t['id']}"):
+        st.markdown(f"**完成「{t['task']}」** — 有什麼要留給大家的經驗嗎？（可留白）")
+        details = st.text_area("須注意細節", key=f"cdetails_{t['id']}")
+        mistakes = st.text_area("錯誤經驗／踩過的雷", key=f"cmistakes_{t['id']}")
+        b1, b2 = st.columns(2)
+        confirm = b1.form_submit_button("確認完成", width="stretch")
+        cancel = b2.form_submit_button("取消", width="stretch")
+    if cancel:
+        st.session_state.completing_id = None
+        st.rerun()
+    if confirm:
+        if _is_duplicate_submit(("complete", t["id"])):
+            st.info("偵測到重複送出，已略過。")
+            return
+        with st.spinner("更新中…"):
+            data_store.mark_completed(t["id"], True)
+            wrote_exp = bool(details.strip() or mistakes.strip())
+            if wrote_exp:
+                data_store.add_experience(
+                    t["work_item"], details.strip() or "－", mistakes.strip() or "－",
+                    source=f"完成事項：{t['task']}",
+                )
+        _audit("標記完成", t["task"], "並留下經驗" if wrote_exp else "")
+        st.session_state.completing_id = None
+        _flash(f"✅ 已將「{t['task']}」標記完成（可到「📜 歷史記錄」查詢）" + ("，經驗已存進經驗分享區" if wrote_exp else ""))
+        st.rerun()
 
 
 def render_todo_tab():
@@ -420,7 +499,8 @@ def render_todo_tab():
             "類型", "type", f"type_select_{ekey}", current=editing["type"] if editing else None)
         engineer = _select_with_add(
             "指派人（工程師）", "engineer", f"engineer_select_{ekey}",
-            current=(editing.get("engineer") or None) if editing else None)
+            current=(editing.get("engineer") or None) if editing else (
+                st.session_state.operator if st.session_state.operator in data_store.get_options("engineer") else None))
 
         shareable = st.checkbox(
             "🔁 可共用（此工項可以與其他工項共用移工，例如只需 1 小時或半天就能完成）",
@@ -494,6 +574,7 @@ def render_todo_tab():
                     )
 
             st.session_state.editing_id = None
+            _audit(f"{action}代辦事項", task.strip(), f"{work_item}／{type_}　指派人：{engineer or '－'}　{start_date}~{end_date}")
             _flash(f"✅ 已{action}事項「{task.strip()}」")
             _notify_discord_instant(saved_todo, action)
             st.rerun()
@@ -525,7 +606,7 @@ def render_todo_tab():
         date_range = t["start_date"] if t["start_date"] == t["end_date"] else f"{t['start_date']} ~ {t['end_date']}"
         title = f"{label} {t['task']}" + (" 🔁" if data_store.is_shareable(t) else "")
 
-        with st.expander(title):
+        with st.expander(title, expanded=(st.session_state.get("completing_id") == t["id"])):
             st.write(f"**期限：** {date_range}")
             st.write(f"**工項／類型：** {t['work_item']} ／ {t['type']}")
             if t.get("location"):
@@ -548,15 +629,122 @@ def render_todo_tab():
             if t.get("image_url"):
                 st.image(t["image_url"], caption="圖說", width=300)
 
+            if st.session_state.get("completing_id") == t["id"]:
+                _render_complete_form(t)
+                continue
             c1, c2 = st.columns(2)
             if c1.button("標記完成", key=f"done_{t['id']}"):
-                with st.spinner("更新中…"):
-                    data_store.mark_completed(t["id"], True)
-                _flash(f"✅ 已將「{t['task']}」標記完成（可到「📜 歷史記錄」查詢）")
+                st.session_state.completing_id = t["id"]
                 st.rerun()
             if c2.button("編輯", key=f"edit_{t['id']}"):
                 st.session_state.editing_id = t["id"]
                 st.rerun()
+
+
+def _plan_copy(src_s, dst, all_dispatches, todos_by_id, absences):
+    """規劃「把 src 那天的派工複製到 dst」。回傳 (要新增的紀錄, 略過的說明)。
+    規則跟手動指派完全一樣：休假的不複製、與其他不可共用事項衝突的不複製、目標日不在事項區間內的不複製。"""
+    dst_s = str(dst)
+    dst_assign = _overlapping_assignments(all_dispatches, todos_by_id, dst, dst)
+    dst_absent = data_store.absent_workers_on(absences, dst_s, dst_s)
+    to_add, skipped = [], []
+    seen = set()
+    for d in sorted(all_dispatches, key=lambda x: x["start_date"]):
+        t = todos_by_id.get(d["todo_id"])
+        if t is None or _is_done(t) or not (d["start_date"] <= src_s <= d["end_date"]):
+            continue
+        if not (t["start_date"] <= dst_s <= t["end_date"]):
+            skipped.append(f"「{t['task']}」：{dst_s} 不在事項期間（{_fmt_range(t['start_date'], t['end_date'])}）內")
+            continue
+        ok = []
+        for w in data_store.split_workers(d.get("workers", "")):
+            if (t["id"], w) in seen:
+                continue
+            seen.add((t["id"], w))
+            if w in dst_absent:
+                skipped.append(f"「{t['task']}」的 {w}：目標日休假／回國")
+                continue
+            reason = _block_reason(dst_assign.get(w, []), t["id"], data_store.is_shareable(t))
+            if reason:
+                skipped.append(f"「{t['task']}」的 {w}：{reason}")
+                continue
+            ok.append(w)
+            dst_assign.setdefault(w, []).append({"todo": t, "ranges": [dst_s]})
+        if ok:
+            to_add.append((t, ok))
+    return to_add, skipped
+
+
+def render_copy_dispatch(todos_by_id, all_dispatches):
+    today = datetime_now_taipei_date()
+    with st.expander("📋 複製某天的派工到另一天（例如把今天的人力複製到明天）"):
+        c1, c2 = st.columns(2)
+        src = c1.date_input("來源日期（複製這天的派工）", value=today, key="copy_src")
+        dst = c2.date_input("目標日期", value=today + timedelta(days=1), key="copy_dst")
+        if src == dst:
+            st.info("來源與目標是同一天，不需要複製。")
+            return
+        to_add, skipped = _plan_copy(str(src), dst, all_dispatches, todos_by_id, data_store.get_absences())
+        if not to_add and not skipped:
+            st.caption(f"{src} 這天沒有可以複製的派工。")
+            return
+        if to_add:
+            st.markdown(f"**會複製到 {dst} 的派工：**")
+            for t, ws in to_add:
+                st.write(f"・{t['task']}：{'、'.join(ws)}")
+        if skipped:
+            st.warning("以下不會複製（請之後手動安排）：\n" + "\n".join(f"・{x}" for x in skipped))
+        if to_add and st.button(f"確認複製到 {dst}", key="copy_confirm"):
+            if _is_duplicate_submit(("copy", str(src), str(dst))):
+                st.info("偵測到重複送出，已略過。")
+                return
+            with st.spinner("複製中，請稍候…"):
+                data_store.add_dispatches([(t["id"], str(dst), str(dst), data_store.join_workers(ws)) for t, ws in to_add])
+            _audit("複製派工", f"{src} → {dst}", f"{len(to_add)} 個事項")
+            lines = [f"📋 **複製派工**　{src} → {dst}"] + [f"・{t['task']}：{'、'.join(ws)}" for t, ws in to_add]
+            _send_discord_async("\n".join(lines))
+            _flash(f"✅ 已複製 {len(to_add)} 個事項的派工到 {dst}" + (f"（另有 {len(skipped)} 項略過）" if skipped else ""))
+            st.rerun()
+
+
+def render_worker_week_tab():
+    st.subheader("📆 移工週表")
+    st.caption("橫軸是日期、縱軸是移工。空白＝可以派工；🏖️＝休假／回國；其餘是當天被派去的事項（有 🔁 代表同時做多件）。")
+    today = datetime_now_taipei_date()
+    start = st.date_input("起始日期（往後顯示 7 天）", value=today, key="week_start")
+    days = [start + timedelta(days=i) for i in range(7)]
+    day_s = [d.isoformat() for d in days]
+
+    todos_by_id = {t["id"]: t for t in data_store.get_todos()}
+    dispatches = data_store.get_dispatches()
+    absences = data_store.get_absences()
+    workers = data_store.get_options("worker")
+
+    cell = {w: {d: [] for d in day_s} for w in workers}
+    for d in dispatches:
+        t = todos_by_id.get(d["todo_id"])
+        if t is None or _is_done(t):
+            continue
+        for ds_ in day_s:
+            if d["start_date"] <= ds_ <= d["end_date"]:
+                for w in data_store.split_workers(d.get("workers", "")):
+                    cell.setdefault(w, {x: [] for x in day_s})[ds_].append(t["task"])
+
+    wd = data_store.WEEKDAY_NAMES
+    rows = []
+    for w, per_day in cell.items():
+        row = {"移工": w}
+        for d, ds_ in zip(days, day_s):
+            tasks = per_day[ds_]
+            off = bool(data_store.absent_workers_on([a for a in absences if a["worker"] == w], ds_, ds_))
+            text = ""
+            if off:
+                text = "🏖️休" + ("（⚠️已排班：" + "、".join(tasks) + "）" if tasks else "")
+            elif tasks:
+                text = ("🔁 " if len(tasks) > 1 else "") + "、".join(tasks)
+            row[f"{d.month}/{d.day}（{wd[d.weekday()]}）"] = text
+        rows.append(row)
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 
 def render_dispatch_assignment_tab():
@@ -575,6 +763,8 @@ def render_dispatch_assignment_tab():
     todos_by_id = {t["id"]: t for t in all_todos}
     today = datetime_now_taipei_date()
     active_todos.sort(key=lambda t: t["start_date"])
+
+    render_copy_dispatch(todos_by_id, all_dispatches)
 
     def _fmt(t):
         rng = _fmt_range(t["start_date"], t["end_date"])
@@ -757,11 +947,14 @@ def render_dispatch_assignment_tab():
                     else:
                         data_store.update_dispatch(editing_dispatch["id"], str(d_start), str(d_end), workers_str)
                 st.session_state.editing_dispatch_id = None
+                _audit("更新派工" + ("（部分日期）" if partial else ""), todo["task"],
+                       f"{_fmt_range(editing_dispatch['start_date'], editing_dispatch['end_date'])} {editing_dispatch['workers']} → {_fmt_range(str(d_start), str(d_end))} {workers_str}")
                 _flash(f"✅ 已更新派工：{_fmt_range(str(d_start), str(d_end))}　{'、'.join(selected)}")
                 _notify_discord_dispatch_update(todo, editing_dispatch, d_start, d_end, selected, partial)
             else:
                 with st.spinner("指派中，請稍候…"):
                     record = data_store.add_dispatch(todo["id"], str(d_start), str(d_end), workers_str)
+                _audit("新增派工", todo["task"], f"{_fmt_range(str(d_start), str(d_end))} {workers_str}")
                 _flash(f"✅ 已指派：{'、'.join(selected)}")
                 _notify_discord_dispatch(todo, record)
             st.rerun()
@@ -786,6 +979,7 @@ def render_dispatch_assignment_tab():
         if c3.button("刪除", key=f"del_dispatch_{d['id']}"):
             with st.spinner("刪除中…"):
                 data_store.delete_dispatch(d["id"])
+            _audit("刪除派工", todo["task"], f"{rng} {d['workers']}")
             _flash(f"已刪除 {rng} 的派工紀錄")
             st.rerun()
 
@@ -899,8 +1093,14 @@ def render_history_tab():
     st.caption("這裡可以查到所有代辦事項，包含已完成、已不在主清單顯示的項目。")
 
     todos = data_store.get_todos()
+    include_archive = st.toggle("包含已封存的舊事項（唯讀）", key="history_include_archive")
+    archived_dispatches = []
+    if include_archive:
+        todos = todos + [dict(t, _archived=True) for t in data_store.get_archived_todos()]
+        archived_dispatches = data_store.get_archived_dispatches()
     if not todos:
         st.info("目前沒有任何代辦事項紀錄。")
+        _render_history_admin()
         return
 
     c1, c2, c3 = st.columns(3)
@@ -932,9 +1132,12 @@ def render_history_tab():
     st.caption(f"共找到 {len(filtered)} 筆")
     if not filtered:
         st.info("沒有符合條件的紀錄。")
+        _render_history_admin()
         return
 
-    dispatches_by_todo = data_store.get_dispatches_by_todo()  # 一次分好組
+    dispatches_by_todo = {k: list(v) for k, v in data_store.get_dispatches_by_todo().items()}  # 一次分好組
+    for d in archived_dispatches:
+        dispatches_by_todo.setdefault(d["todo_id"], []).append(d)
 
     rows = []
     for t in filtered:
@@ -943,7 +1146,7 @@ def render_history_tab():
         dispatches = dispatches_by_todo.get(t["id"], [])
         workers_set = {w for d in dispatches for w in data_store.split_workers(d.get("workers", ""))}
         rows.append({
-            "狀態": "✅已完成" if completed else "🔸進行中",
+            "狀態": "🗄️已封存" if t.get("_archived") else ("✅已完成" if completed else "🔸進行中"),
             "事項說明": t["task"],
             "工項": t["work_item"],
             "類型": t["type"],
@@ -955,9 +1158,14 @@ def render_history_tab():
 
     st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
+    live = [t for t in filtered if not t.get("_archived")]
     with st.expander("✏️ 修正完成狀態（例如不小心標錯）"):
-        ids = [t["id"] for t in filtered]
-        by_id = {t["id"]: t for t in filtered}
+        if not live:
+            st.caption("篩選結果裡沒有可以修正的事項（已封存的事項是唯讀的）。")
+            _render_history_admin()
+            return
+        ids = [t["id"] for t in live]
+        by_id = {t["id"]: t for t in live}
 
         def _label(i):
             t = by_id[i]
@@ -971,8 +1179,45 @@ def render_history_tab():
         if st.button(btn_label, key="history_toggle_btn"):
             with st.spinner("更新中…"):
                 data_store.mark_completed(target["id"], not target_completed)
+            _audit("取消完成" if target_completed else "標記完成", target["task"], "（歷史頁修正）")
             _flash(f"已將「{target['task']}」{'改回進行中' if target_completed else '標記為已完成'}")
             st.rerun()
+
+    _render_history_admin()
+
+
+def _render_history_admin():
+    """封存舊事項、查看操作紀錄。"""
+    today = datetime_now_taipei_date()
+    with st.expander("🗄️ 封存舊事項（事項變多、App 變慢時使用）"):
+        st.caption("把「已完成、且結束日期早於 N 個月前」的事項連同派工紀錄，搬到雲端的封存分頁。不會刪除資料，之後在上方打開「包含已封存」仍可查詢；主清單與每次讀取會變輕。")
+        months = st.number_input("封存幾個月前完成的事項", min_value=1, max_value=36, value=3, step=1, key="archive_months")
+        cutoff = (today - timedelta(days=30 * int(months))).isoformat()
+        n_eligible = sum(
+            1 for t in data_store.get_todos()
+            if _is_done(t) and t.get("end_date") and t["end_date"] < cutoff
+        )
+        st.write(f"符合條件（結束日期早於 {cutoff}）：**{n_eligible}** 筆")
+        if n_eligible and st.button(f"封存這 {n_eligible} 筆", key="archive_confirm"):
+            if _is_duplicate_submit(("archive", cutoff)):
+                st.info("偵測到重複送出，已略過。")
+            else:
+                with st.spinner("封存中，請稍候…"):
+                    moved = data_store.archive_completed_before(cutoff)
+                _audit("封存舊事項", f"早於 {cutoff}", f"{moved} 筆")
+                _flash(f"✅ 已封存 {moved} 筆事項")
+                st.rerun()
+
+    if st.toggle("🧾 顯示操作紀錄（最近 200 筆）", key="show_audit_log"):
+        log = data_store.get_audit_log()
+        if not log:
+            st.caption("目前還沒有操作紀錄。")
+        else:
+            st.dataframe(
+                pd.DataFrame(log[-200:][::-1]).rename(columns={
+                    "time": "時間", "operator": "操作人", "action": "動作", "target": "對象", "detail": "內容"}),
+                width="stretch", hide_index=True,
+            )
 
 
 def _safe_date(value):
@@ -998,6 +1243,7 @@ def render_experience_tab():
         else:
             with st.spinner("發布中，請稍候…"):
                 data_store.add_experience(work_item, details, mistakes)
+            _audit("發布經驗", work_item.strip())
             _flash("✅ 已發布經驗")
             st.rerun()
 
@@ -1020,6 +1266,7 @@ def render_experience_tab():
             if st.button("刪除", key=f"expdel_{e['id']}"):
                 with st.spinner("刪除中…"):
                     data_store.delete_experience(e["id"])
+                _audit("刪除經驗", e["work_item"])
                 _flash("已刪除該則經驗")
                 st.rerun()
 
@@ -1045,18 +1292,35 @@ def _show_friendly_error(err):
 def main():
     _init_state()
 
-    head_l, head_r = st.columns([6, 1])
+    head_l, head_m, head_r = st.columns([5, 2, 1])
     head_l.title("🏗️ 營造管理系統")
+    if st.session_state.operator:
+        head_m.markdown(f"👤 **{st.session_state.operator}**")
+        if head_m.button("切換身分", key="switch_operator"):
+            st.session_state.operator = ""
+            if "user" in st.query_params:
+                del st.query_params["user"]
+            st.rerun()
     if head_r.button("🔄 重新整理", help="從雲端重新讀取最新資料。如果你剛剛直接在 Google 試算表裡改了資料，按這個才會立刻看到。"):
         data_store.clear_all_caches()
         st.rerun()
 
     # 用「頁面切換」取代 st.tabs：st.tabs 每次互動都會把 5 個分頁的程式全部執行一遍，
     # 這裡只會執行你目前所在的那一頁，速度差很多。
+    try:
+        if not _render_operator_gate():
+            return
+    except Exception as e:
+        st.session_state.pop("_last_submit", None)
+        traceback.print_exc()
+        _show_friendly_error(e)
+        return
+
     pages = {
         "📋 代辦事項": render_todo_tab,
         "👷 移工指派": render_dispatch_assignment_tab,
         "📅 派工總表": render_dispatch_tab,
+        "📆 移工週表": render_worker_week_tab,
         "📜 歷史記錄": render_history_tab,
         "📚 經驗分享區": render_experience_tab,
     }
