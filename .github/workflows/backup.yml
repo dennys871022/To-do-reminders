@@ -1,0 +1,40 @@
+name: 每週資料備份
+
+# 每週日 22:00（台灣時間）把試算表所有分頁匯出成 CSV，存成 Artifact（保留 90 天）。
+# GitHub 的排程偶爾會延遲，但備份不需要準時，晚幾小時沒關係。
+# 也可以到 Actions 頁面手動按「Run workflow」立刻備份一次。
+on:
+  schedule:
+    - cron: "0 14 * * 0"   # UTC 14:00 = 台灣時間 22:00
+  workflow_dispatch:
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: 匯出所有分頁
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+        run: python backup.py
+      - name: 保存備份檔
+        uses: actions/upload-artifact@v4
+        with:
+          name: sheet-backup-${{ github.run_id }}
+          path: backups/
+          retention-days: 90
+      - name: 備份失敗時通知 Discord
+        if: failure()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          curl -sS -H "Content-Type: application/json" \
+            -d '{"content":"⚠️ 每週資料備份失敗，請到 GitHub Actions 查看原因。"}' \
+            "$DISCORD_WEBHOOK_URL" || true
