@@ -9,7 +9,7 @@ reminder_check.py
 - 17:00：完整晚報，內容格式跟 08:00 相同，收工前再看一次全貌，方便安排隔天派工
 
 已完成、或超過 30 天到期的事項不列入（超過 30 天的太早，還不用管）。
-晚上 21:00 ～ 早上 07:00 為安靜時段不發送。
+晚上 19:00 ～ 早上 07:00 為安靜時段不發送。
 
 這支腳本現在搭配外部排程服務（例如 cron-job.org）在台灣時間 08:00／13:30／17:00
 準時呼叫 GitHub 的 workflow_dispatch 來觸發，不再依賴 GitHub 自己的 schedule
@@ -60,7 +60,12 @@ def _current_slot(now_local):
 
 
 def _today_workers(todo_id, today):
-    """這筆事項「今天」有效的派工紀錄裡，指派了哪些移工（跨好幾筆派工紀錄會合併去重）。"""
+    return _workers_on(todo_id, today)
+
+
+def _workers_on(todo_id, day):
+    """這筆事項「那一天」有效的派工紀錄裡，指派了哪些移工（跨好幾筆派工紀錄會合併去重）。"""
+    today = day
     workers = set()
     for d in data_store.get_dispatches_for_todo(todo_id):
         try:
@@ -73,7 +78,7 @@ def _today_workers(todo_id, today):
     return workers
 
 
-def _item_lines(t, tier, icon, workers):
+def _item_lines(t, tier, icon, workers, today=None):
     date_range = t["start_date"]
     if t["start_date"] != t["end_date"]:
         date_range += f"~{t['end_date']}"
@@ -81,6 +86,9 @@ def _item_lines(t, tier, icon, workers):
     title = f"{icon} **{t['task']}**"
     if tier:
         title += f"　［{tier}］"
+        late = urgency.overdue_days(t.get("end_date"), today) if today else 0
+        if late:
+            title += f"　⏰ 已逾期 {late} 天"
     lines = [title]
 
     meta = f"　🏗️ {t['work_item']}／{t['type']}"
@@ -95,7 +103,37 @@ def _item_lines(t, tier, icon, workers):
     return lines
 
 
-def _build_full_report(active_todos, today, test_mode=False):
+def _build_tomorrow_section(active_todos, today):
+    """17:00 晚報用：明天預計派工的事項與移工，以及明天期間內但還沒排人的事項。"""
+    tomorrow = today + timedelta(days=1)
+    t_s = str(tomorrow)
+    planned, unassigned = [], []
+    for t in active_todos:
+        if not (t.get("start_date", "") <= t_s <= t.get("end_date", "")):
+            continue
+        ws = _workers_on(t["id"], tomorrow)
+        (planned if ws else unassigned).append((t, ws))
+    lines = ["", f"🗓️ **明日（{tomorrow.month}/{tomorrow.day}）預計派工**"]
+    if planned:
+        for t, ws in planned:
+            lines.append(f"　・{t['task']}（{t['work_item']}）：{'、'.join(sorted(ws))}")
+    else:
+        lines.append("　目前還沒有排任何人")
+    if unassigned:
+        lines.append("　⚠️ 明天期間內、尚未排人：" + "、".join(t["task"] for t, _ in unassigned))
+    try:
+        absent = data_store.absent_workers_on(data_store.get_absences(), t_s, t_s)
+    except Exception:
+        absent = {}
+    if absent:
+        lines.append("　🏖️ 明日休假：" + "、".join(sorted(absent)))
+        clash = sorted({w for _, ws in planned for w in ws if w in absent})
+        if clash:
+            lines.append("　⚠️ 明日已排班但登記休假，請換人：" + "、".join(clash))
+    return lines
+
+
+def _build_full_report(active_todos, today, test_mode=False, include_tomorrow=False):
     """08:00／17:00 用的完整報告：今日派工段落 + 依緊急程度的未派工段落。"""
     dispatched = []  # (tier, todo, workers)
     pending_by_tier = {tier: [] for tier in urgency.TIER_ORDER}
@@ -133,7 +171,7 @@ def _build_full_report(active_todos, today, test_mode=False):
         for tier, t, workers in dispatched:
             icon = urgency.TIER_ICONS.get(tier, "⚪") if tier else "⚪"
             lines.append("")
-            lines.extend(_item_lines(t, tier, icon, workers))
+            lines.extend(_item_lines(t, tier, icon, workers, today))
 
     if any(pending_by_tier.values()):
         lines.append("")
@@ -141,7 +179,10 @@ def _build_full_report(active_todos, today, test_mode=False):
         for tier in urgency.TIER_ORDER:
             for t in pending_by_tier[tier]:
                 lines.append("")
-                lines.extend(_item_lines(t, tier, urgency.TIER_ICONS.get(tier, "⚪"), None))
+                lines.extend(_item_lines(t, tier, urgency.TIER_ICONS.get(tier, "⚪"), None, today))
+
+    if include_tomorrow:
+        lines.extend(_build_tomorrow_section(active_todos, today))
 
     return total, "\n".join(lines)
 
@@ -158,7 +199,7 @@ def _build_urgent_only_text(active_todos, today, test_mode=False):
     lines = [f"{head}**【午間提醒】非常緊急事項共 {len(items)} 筆**"]
     for t, workers in items:
         lines.append("")
-        lines.extend(_item_lines(t, "非常緊急", "🔴", workers))
+        lines.extend(_item_lines(t, "非常緊急", "🔴", workers, today))
 
     return len(items), "\n".join(lines)
 
@@ -168,8 +209,10 @@ def run(now_utc, force=False):
     today = now_local.date()
     print(f"[執行時間] 台灣時間 {now_local:%Y-%m-%d %H:%M}　強制測試模式：{force}")
 
+    include_tomorrow = False
     if force:
         report_type = "full"
+        include_tomorrow = True
     else:
         in_quiet = now_local.hour >= QUIET_START_HOUR or now_local.hour < QUIET_END_HOUR
         if in_quiet:
@@ -183,13 +226,14 @@ def run(now_utc, force=False):
         slot_label = f"{slot.hour:02d}:{slot.minute:02d}"
         print(f"[對應時段] {slot_label}")
         report_type = "urgent_only" if slot_label == "13:30" else "full"
+        include_tomorrow = slot.hour >= 12  # 17:00 晚報加上明日預告
 
     todos = data_store.get_todos()
     active_todos = [t for t in todos if not _is_completed(t)]
     print(f"[資料] 共 {len(todos)} 筆代辦事項，{len(active_todos)} 筆進行中")
 
     if report_type == "full":
-        total, text = _build_full_report(active_todos, today, test_mode=force)
+        total, text = _build_full_report(active_todos, today, test_mode=force, include_tomorrow=include_tomorrow)
     else:
         total, text = _build_urgent_only_text(active_todos, today, test_mode=force)
 
