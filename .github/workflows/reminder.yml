@@ -42,3 +42,12 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           FORCE_SEND: ${{ inputs.force }}
         run: python reminder_check.py
+
+      - name: 提醒失敗時通知 Discord
+        if: failure()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          curl -sS -H "Content-Type: application/json" \
+            -d '{"content":"⚠️ 代辦提醒排程執行失敗，這個時段的提醒可能沒有送出。請到 GitHub Actions 查看原因。"}' \
+            "$DISCORD_WEBHOOK_URL" || true
