@@ -26,11 +26,13 @@ def _get_webhook_url():
     return os.environ.get("DISCORD_WEBHOOK_URL")
 
 
-def send_discord_message(text, button_label=None, button_url=None, webhook_url=None):
+def send_discord_message(text, button_label=None, button_url=None, webhook_url=None, images=None):
     """
     傳送一則訊息到 Discord 頻道。如果有給 button_label/button_url，
     會用 embed 的方式在訊息下方附上一個可以點的連結（Discord webhook
     訊息本身不支援互動按鈕，用「附上連結」的方式達到類似效果）。
+    images：[(標題, 圖片網址), ...]，每張圖用一個 embed 顯示在訊息下方
+    （Discord 一則訊息最多 10 個 embed，所以最多顯示 9 張圖，最後一個留給按鈕連結）。
     """
     url = webhook_url or _get_webhook_url()
     if not url:
@@ -46,13 +48,19 @@ def send_discord_message(text, button_label=None, button_url=None, webhook_url=N
         "allowed_mentions": {"parse": []},
     }
 
+    embeds = []
+    for title, img_url in (images or [])[:9]:
+        if img_url and str(img_url).startswith("http"):
+            embeds.append({"title": str(title)[:200], "image": {"url": img_url}, "color": 0x3498DB})
     if button_label and button_url:
-        payload["embeds"] = [
+        embeds.append(
             {
                 "description": f"[{button_label}]({button_url})",
                 "color": 0x2ECC71,
             }
-        ]
+        )
+    if embeds:
+        payload["embeds"] = embeds
 
     resp = requests.post(url, json=payload, timeout=10)
     if resp.status_code not in (200, 204):
