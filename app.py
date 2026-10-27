@@ -235,7 +235,8 @@ def _describe_assignments(entries):
         t = x["todo"]
         place = f"{t['work_item']}／{t['location']}" if t.get("location") else t["work_item"]
         share = "可共用" if data_store.is_shareable(t) else "不可共用"
-        parts.append(f"「{t['task']}」（{place}，{'、'.join(x['ranges'])}，{share}）")
+        who = f"，指派人：{t['engineer']}" if t.get("engineer") else "，指派人：未填"
+        parts.append(f"「{t['task']}」（{place}，{'、'.join(x['ranges'])}，{share}{who}）")
     return "；".join(parts)
 
 
@@ -248,7 +249,10 @@ def _block_reason(entries, picked_todo_id, new_shareable):
     if any(x["todo"]["id"] == picked_todo_id for x in entries):
         return "本事項這段期間已安排過這位移工"
     if not new_shareable:
-        exclusive = [x["todo"]["task"] for x in entries if not data_store.is_shareable(x["todo"])]
+        exclusive = [
+            x["todo"]["task"] + (f"（指派人：{x['todo']['engineer']}）" if x["todo"].get("engineer") else "")
+            for x in entries if not data_store.is_shareable(x["todo"])
+        ]
         if exclusive:
             names = "、".join(f"「{n}」" for n in exclusive)
             return f"本事項與{names}都不可共用，不能重疊"
@@ -771,7 +775,8 @@ def render_dispatch_assignment_tab():
     def _fmt(t):
         rng = _fmt_range(t["start_date"], t["end_date"])
         loc = f"／{t['location']}" if t.get("location") else ""
-        return f"{t['task']}（{rng}{loc}）" + (" 🔁" if data_store.is_shareable(t) else "")
+        who = f"｜指派人：{t['engineer']}" if t.get("engineer") else ""
+        return f"{t['task']}（{rng}{loc}）{who}" + (" 🔁" if data_store.is_shareable(t) else "")
 
     # 選項用「事項 id」而不是「第幾筆」：多人同時使用時，別人新增或完成了事項，
     # 清單的順序會變，用順序當選項的話你選的事項會悄悄變成別的事項。
@@ -812,8 +817,11 @@ def render_dispatch_assignment_tab():
 
     todo_start = date.fromisoformat(todo["start_date"])
     todo_end = date.fromisoformat(todo["end_date"])
-    st.caption(
-        f"這筆事項整體區間：{todo_start} ～ {todo_end}　｜　"
+    st.info(
+        f"👤 **指派人：{todo.get('engineer') or '（未填）'}**　　"
+        f"🏗️ {todo['work_item']}／{todo['type']}"
+        + (f"　　📍 {todo['location']}" if todo.get("location") else "")
+        + f"\n\n事項整體區間：{todo_start} ～ {todo_end}　｜　"
         + ("🔁 可共用" if new_shareable else "不可共用")
     )
 
