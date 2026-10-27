@@ -91,7 +91,7 @@ def _is_duplicate_submit(token, window_seconds=10):
     return False
 
 
-def _send_discord_async(text):
+def _send_discord_async(text, images=None):
     """在背景發送 Discord 訊息，不讓使用者等它；失敗時記錄起來，下次畫面更新時提醒。"""
     errors = st.session_state.setdefault("_notify_errors", [])
     op = st.session_state.get("operator")
@@ -105,7 +105,7 @@ def _send_discord_async(text):
 
     def _worker():
         try:
-            discord_notify.send_discord_message(text, webhook_url=webhook_url)
+            discord_notify.send_discord_message(text, webhook_url=webhook_url, images=images)
         except Exception as e:  # 通知失敗不影響資料
             errors.append(str(e))
 
@@ -184,7 +184,8 @@ def _notify_discord_instant(todo, action):
         if data_store.is_shareable(todo):
             lines.append("🔁 可共用（可與其他工項共用移工）")
 
-        _send_discord_async("\n".join(lines))
+        images = [(todo["task"], todo["image_url"])] if todo.get("image_url") else None
+        _send_discord_async("\n".join(lines), images=images)
     except Exception:
         traceback.print_exc()  # 組訊息出錯也不能影響已經存好的資料
 
@@ -269,7 +270,8 @@ def _notify_discord_dispatch(todo, dispatch):
             lines.append(f"指派人：{todo['engineer']}")
         lines.append(f"派工日期：{rng}")
         lines.append(f"移工：{dispatch['workers']}")
-        _send_discord_async("\n".join(lines))
+        images = [(todo["task"], todo["image_url"])] if todo.get("image_url") else None
+        _send_discord_async("\n".join(lines), images=images)
     except Exception:
         traceback.print_exc()
 
