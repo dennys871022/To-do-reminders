@@ -187,6 +187,26 @@ def _build_full_report(active_todos, today, test_mode=False, include_tomorrow=Fa
     return total, "\n".join(lines)
 
 
+def _report_images(active_todos, today, report_type):
+    """這份報告涵蓋的事項裡，有上傳圖說的，依「今日派工 > 緊急程度」排序後回傳 [(標題, 網址)]。"""
+    ranked = []
+    for t in active_todos:
+        url = (t.get("image_url") or "").strip()
+        if not url:
+            continue
+        tier = urgency.classify_tier(t.get("end_date"), today)
+        has_workers = bool(_workers_on(t["id"], today))
+        if report_type == "urgent_only":
+            if tier != "非常緊急":
+                continue
+        elif not (has_workers or tier):
+            continue
+        order = urgency.TIER_ORDER.index(tier) if tier in urgency.TIER_ORDER else len(urgency.TIER_ORDER)
+        ranked.append((0 if has_workers else 1, order, t["task"], url))
+    ranked.sort(key=lambda x: (x[0], x[1]))
+    return [(task, url) for _, _, task, url in ranked]
+
+
 def _build_urgent_only_text(active_todos, today, test_mode=False):
     """13:30 用的簡短提醒：只列「非常緊急」的事項。"""
     items = []
@@ -243,7 +263,9 @@ def run(now_utc, force=False):
         return
 
     try:
-        send_discord_message(text, button_label="📋 開啟代辦系統", button_url=APP_URL)
+        images = _report_images(active_todos, today, report_type)
+        print(f"[圖說] 報告內有 {len(images)} 張圖（最多顯示 9 張）")
+        send_discord_message(text, button_label="📋 開啟代辦系統", button_url=APP_URL, images=images)
     except Exception as e:
         print(f"推播失敗，Discord 訊息沒有送出：{e}")
         raise SystemExit(1)  # 讓 workflow 顯示紅色失敗，方便及早發現
