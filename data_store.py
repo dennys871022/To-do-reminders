@@ -46,7 +46,7 @@ CACHE_TTL_SECONDS = 120
 TODO_HEADERS = [
     "id", "start_date", "end_date", "task", "location", "urgency",
     "work_item", "type", "completed", "created_at", "last_reminder_at",
-    "image_url", "engineer", "workers", "shareable",
+    "image_url", "engineer", "workers", "shareable", "remind_only", "event_time",
 ]
 EXP_HEADERS = ["id", "work_item", "source", "details", "mistakes", "created_at"]
 OPTION_HEADERS = ["category", "value"]
@@ -83,6 +83,27 @@ def split_workers(workers_str):
 
 def join_workers(workers_list):
     return WORKERS_SEPARATOR.join(workers_list)
+
+
+def is_remind_only(todo):
+    """這筆事項是否標記為「僅提醒」（例如開會：不需要派工，只要提醒大家）。舊資料沒有這欄，視為需要派工。"""
+    return str((todo or {}).get("remind_only", "")).strip().upper() == "TRUE"
+
+
+def normalize_time(value):
+    """把 "9:30"、"14:00"、"1400" 之類的輸入整理成 "HH:MM"；空白回傳 ""；格式不對回傳 None。"""
+    v = str(value or "").strip().replace("：", ":")
+    if not v:
+        return ""
+    if v.isdigit() and len(v) in (3, 4):
+        v = v[:-2] + ":" + v[-2:]
+    parts = v.split(":")
+    if len(parts) != 2 or not all(p.isdigit() for p in parts):
+        return None
+    h, m = int(parts[0]), int(parts[1])
+    if not (0 <= h <= 23 and 0 <= m <= 59):
+        return None
+    return f"{h:02d}:{m:02d}"
 
 
 def is_shareable(todo):
@@ -386,7 +407,8 @@ def get_todos():
 
 @_write_op
 def add_todo(start_date, end_date, task, location, work_item, type_,
-             image_url="", engineer="", workers="", shareable=False):
+             image_url="", engineer="", workers="", shareable=False,
+             remind_only=False, event_time=""):
     """新增代辦事項。緊急程度不由使用者傳入，一律由到期日自動判定。"""
     row = {
         "id": _gen_id("todo"),
@@ -404,6 +426,8 @@ def add_todo(start_date, end_date, task, location, work_item, type_,
         "engineer": engineer,
         "workers": workers,
         "shareable": "TRUE" if shareable else "FALSE",
+        "remind_only": "TRUE" if remind_only else "FALSE",
+        "event_time": event_time or "",
     }
     _todo_ws().append_row([row[h] for h in TODO_HEADERS])
     get_todos.clear()
