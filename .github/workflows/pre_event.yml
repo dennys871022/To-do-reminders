@@ -1,0 +1,30 @@
+name: 會前一小時提醒
+
+# 由 cron-job.org 每 30 分鐘呼叫 workflow_dispatch 觸發（排程建議：台灣時間 07:00–18:30，分鐘填 0,30）。
+# 這支腳本只在「有『僅提醒』事項、且約一小時後開始」時才會發訊息，其餘時候直接結束、不發任何東西。
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: discord-pre-event
+  cancel-in-progress: false
+
+jobs:
+  pre-event:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: 檢查有沒有即將開始的提醒事項
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          # 排程間隔（分鐘）。cron-job.org 設每 30 分鐘就維持 30；改成每小時一次就改 60。
+          PRE_EVENT_INTERVAL_MIN: "30"
+        run: python reminder_check.py --pre-event
