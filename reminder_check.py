@@ -109,6 +109,8 @@ def _build_tomorrow_section(active_todos, today):
     t_s = str(tomorrow)
     planned, unassigned = [], []
     for t in active_todos:
+        if data_store.is_remind_only(t):
+            continue
         if not (t.get("start_date", "") <= t_s <= t.get("end_date", "")):
             continue
         ws = _workers_on(t["id"], tomorrow)
@@ -133,8 +135,37 @@ def _build_tomorrow_section(active_todos, today):
     return lines
 
 
-def _build_full_report(active_todos, today, test_mode=False, include_tomorrow=False):
-    """08:00／17:00 用的完整報告：今日派工段落 + 依緊急程度的未派工段落。"""
+def _reminder_items(active_todos, today, remind_days=(0, 1)):
+    """「僅提醒」事項（開會等）：以結束日期為事件日，回傳 [(第幾天後, 事項)]，依日期、時間排序。
+    08:00 晨報只帶「今天」，17:00 晚報只帶「明天」（所以是前一天晚上＋當天早上各提醒一次）。"""
+    wanted = {str(today + timedelta(days=d)): d for d in remind_days}
+    out = []
+    for t in active_todos:
+        if data_store.is_remind_only(t) and t.get("end_date") in wanted:
+            out.append((wanted[t["end_date"]], t))
+    out.sort(key=lambda x: (x[0], x[1].get("event_time") or "99:99"))
+    return out
+
+
+DAY_WORDS = {0: "今天", 1: "明天"}
+
+
+def _reminder_line(day_offset, t, prefix="　"):
+    when = DAY_WORDS.get(day_offset, "")
+    tm = t.get("event_time") or ""
+    head = f"{prefix}{when}{(' ' + tm) if tm else ''}　**{t['task']}**".replace("　　", "　")
+    extra = []
+    if t.get("location"):
+        extra.append(f"📍 {t['location']}")
+    if t.get("engineer"):
+        extra.append(f"👤 {t['engineer']}")
+    return head + (("　" + "　".join(extra)) if extra else "")
+
+
+def _build_full_report(active_todos, today, test_mode=False, include_tomorrow=False, remind_days=(0, 1)):
+    """08:00／17:00 用的完整報告：今日派工段落 + 依緊急程度的未派工段落 + 會議／行政提醒。"""
+    reminders = _reminder_items(active_todos, today, remind_days)
+    active_todos = [t for t in active_todos if not data_store.is_remind_only(t)]
     dispatched = []  # (tier, todo, workers)
     pending_by_tier = {tier: [] for tier in urgency.TIER_ORDER}
 
@@ -146,9 +177,15 @@ def _build_full_report(active_todos, today, test_mode=False, include_tomorrow=Fa
         elif tier:
             pending_by_tier[tier].append(t)
 
-    total = len(dispatched) + sum(len(v) for v in pending_by_tier.values())
+    total = len(dispatched) + sum(len(v) for v in pending_by_tier.values()) + len(reminders)
     head = "【測試】" if test_mode else ""
     lines = [f"{head}**【代辦提醒】共 {total} 筆事項需要注意**"]
+
+    if reminders:
+        lines.append("")
+        lines.append("📣 **會議／行政提醒**")
+        for d, t in reminders:
+            lines.append(_reminder_line(d, t))
 
     try:
         absent_today = data_store.absent_workers_on(data_store.get_absences(), str(today), str(today))
@@ -187,10 +224,17 @@ def _build_full_report(active_todos, today, test_mode=False, include_tomorrow=Fa
     return total, "\n".join(lines)
 
 
-def _report_images(active_todos, today, report_type):
-    """這份報告涵蓋的事項裡，有上傳圖說的，依「今日派工 > 緊急程度」排序後回傳 [(標題, 網址)]。"""
+def _report_images(active_todos, today, report_type, remind_days=(0, 1)):
+    """這份報告涵蓋的事項裡，有上傳圖說的，依「提醒 > 今日派工 > 緊急程度」排序後回傳 [(標題, 網址)]。"""
     ranked = []
+    if report_type != "urgent_only":
+        for d, t in _reminder_items(active_todos, today, remind_days):
+            url = (t.get("image_url") or "").strip()
+            if url:
+                ranked.append((-1, d, t["task"], url))
     for t in active_todos:
+        if data_store.is_remind_only(t):
+            continue
         url = (t.get("image_url") or "").strip()
         if not url:
             continue
@@ -211,6 +255,8 @@ def _build_urgent_only_text(active_todos, today, test_mode=False):
     """13:30 用的簡短提醒：只列「非常緊急」的事項。"""
     items = []
     for t in active_todos:
+        if data_store.is_remind_only(t):
+            continue
         tier = urgency.classify_tier(t.get("end_date"), today)
         if tier == "非常緊急":
             items.append((t, _today_workers(t["id"], today)))
@@ -230,6 +276,7 @@ def run(now_utc, force=False):
     print(f"[執行時間] 台灣時間 {now_local:%Y-%m-%d %H:%M}　強制測試模式：{force}")
 
     include_tomorrow = False
+    remind_days = (0, 1)
     if force:
         report_type = "full"
         include_tomorrow = True
@@ -247,13 +294,15 @@ def run(now_utc, force=False):
         print(f"[對應時段] {slot_label}")
         report_type = "urgent_only" if slot_label == "13:30" else "full"
         include_tomorrow = slot.hour >= 12  # 17:00 晚報加上明日預告
+        remind_days = (1,) if slot.hour >= 12 else (0,)  # 僅提醒事項：前一天 17:00 提醒「明天」、當天 08:00 提醒「今天」
 
     todos = data_store.get_todos()
     active_todos = [t for t in todos if not _is_completed(t)]
     print(f"[資料] 共 {len(todos)} 筆代辦事項，{len(active_todos)} 筆進行中")
 
     if report_type == "full":
-        total, text = _build_full_report(active_todos, today, test_mode=force, include_tomorrow=include_tomorrow)
+        total, text = _build_full_report(active_todos, today, test_mode=force, include_tomorrow=include_tomorrow,
+                                         remind_days=remind_days)
     else:
         total, text = _build_urgent_only_text(active_todos, today, test_mode=force)
 
@@ -263,7 +312,7 @@ def run(now_utc, force=False):
         return
 
     try:
-        images = _report_images(active_todos, today, report_type)
+        images = _report_images(active_todos, today, report_type, remind_days)
         print(f"[圖說] 報告內有 {len(images)} 張圖（最多顯示 9 張）")
         send_discord_message(text, button_label="📋 開啟代辦系統", button_url=APP_URL, images=images)
     except Exception as e:
@@ -277,7 +326,62 @@ def run(now_utc, force=False):
     # 容易撞到頻率限制，還會拖慢同一時間打開 App 的使用者。
 
 
+def pre_event_candidates(active_todos, now_local, interval_min=30):
+    """開始前約一小時要提醒的「僅提醒」事項。排程每 interval_min 分鐘跑一次，
+    視窗寬度剛好等於排程間隔：[60 - 間隔/2, 60 + 間隔/2) 分鐘前，所以每個事件剛好被某一次執行抓到、不會重複也不會漏。
+    回傳 [(距開始幾分鐘, 事項)]。"""
+    lo, hi = 60 - interval_min / 2, 60 + interval_min / 2
+    out = []
+    for t in active_todos:
+        if not data_store.is_remind_only(t) or t.get("end_date") != str(now_local.date()):
+            continue
+        tm = data_store.normalize_time(t.get("event_time"))
+        if not tm:
+            continue
+        h, m = int(tm[:2]), int(tm[3:])
+        start = now_local.replace(hour=h, minute=m, second=0, microsecond=0)
+        mins = (start - now_local).total_seconds() / 60
+        if lo <= mins < hi:
+            out.append((round(mins), t))
+    return out
+
+
+def run_pre_event(now_utc, force=False, interval_min=30):
+    """「會前一小時」提醒：由 cron-job.org 每 30 分鐘觸發一次（見 pre_event.yml）。沒有符合的事項就什麼都不發。"""
+    now_local = now_utc.astimezone(TZ)
+    print(f"[會前提醒] 台灣時間 {now_local:%Y-%m-%d %H:%M}　間隔 {interval_min} 分鐘")
+    if now_local.hour >= QUIET_START_HOUR or now_local.hour < QUIET_END_HOUR:
+        print("目前是安靜時段，不發送。")
+        return
+    todos = data_store.get_todos()
+    active = [t for t in todos if not _is_completed(t)]
+    hits = pre_event_candidates(active, now_local, interval_min)
+    if not hits:
+        print("沒有即將開始的提醒事項。")
+        return
+    lines = ["⏰ **即將開始**"]
+    for mins, t in hits:
+        lines.append("")
+        lines.append(f"　約 {mins} 分鐘後（{t['event_time']}）　**{t['task']}**")
+        if t.get("location"):
+            lines.append(f"　📍 {t['location']}")
+        if t.get("engineer"):
+            lines.append(f"　👤 {t['engineer']}")
+    images = [(t["task"], t["image_url"]) for _, t in hits if (t.get("image_url") or "").strip()]
+    try:
+        send_discord_message("\n".join(lines), button_label="📋 開啟代辦系統", button_url=APP_URL, images=images)
+    except Exception as e:
+        print(f"推播失敗，Discord 訊息沒有送出：{e}")
+        raise SystemExit(1)
+    print(f"已推播 1 則會前提醒（{len(hits)} 筆）。")
+
+
 def main():
+    import sys
+    if "--pre-event" in sys.argv:
+        interval = int(os.environ.get("PRE_EVENT_INTERVAL_MIN", "30") or 30)
+        run_pre_event(datetime.now(timezone.utc), interval_min=interval)
+        return
     force = os.environ.get("FORCE_SEND", "").strip().lower() == "true"
     run(datetime.now(timezone.utc), force=force)
 
