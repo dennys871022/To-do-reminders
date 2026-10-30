@@ -166,6 +166,8 @@ def _notify_discord_instant(todo, action):
         today = datetime_now_taipei_date()
         tier = urgency.classify_tier(todo.get("end_date"), today) or "一般"
         icon = "🆕" if action == "新增" else "✏️"
+        if data_store.is_remind_only(todo):
+            icon = "📣"
 
         date_range = todo["start_date"]
         if todo["start_date"] != todo["end_date"]:
@@ -178,9 +180,11 @@ def _notify_discord_instant(todo, action):
         ]
         if todo.get("location"):
             lines.append(f"地點：{todo['location']}")
-        lines.append(f"期限：{date_range}")
+        lines.append(f"期限：{date_range}" + (f"　⏰ {todo['event_time']}" if todo.get("event_time") else ""))
         if todo.get("engineer"):
             lines.append(f"指派人：{todo['engineer']}")
+        if data_store.is_remind_only(todo):
+            lines.append("📣 僅提醒（不需派工）")
         if data_store.is_shareable(todo):
             lines.append("🔁 可共用（可與其他工項共用移工）")
 
@@ -508,6 +512,16 @@ def render_todo_tab():
             current=(editing.get("engineer") or None) if editing else (
                 st.session_state.operator if st.session_state.operator in data_store.get_options("engineer") else None))
 
+        remind_only = st.checkbox(
+            "📣 僅提醒（不需派工，例如開會、協議組織會議）",
+            value=data_store.is_remind_only(editing) if editing else False,
+            key=f"remind_only_{ekey}",
+            help="勾選後：不會出現在「移工指派」，也不會被當成「尚未安排移工」。推播改成「前一天 17:00」與「當天 08:00」各提醒一次；有填時間的話，開始前約一小時還會再提醒。日期以「結束日期」為準（開會就兩個日期填同一天）。",
+        )
+        event_time_in = st.text_input(
+            "時間（選填，例如 14:00）", value=(editing.get("event_time") or "") if editing else "",
+            key=f"event_time_{ekey}", help="填了之後，提醒會顯示「今天 14:00 ○○會議」。留白＝不指定時間。")
+
         shareable = st.checkbox(
             "🔁 可共用（此工項可以與其他工項共用移工，例如只需 1 小時或半天就能完成）",
             value=data_store.is_shareable(editing) if editing else False,
@@ -545,9 +559,12 @@ def render_todo_tab():
             st.error("結束日期不能早於開始日期")
         elif not work_item or not type_:
             st.error("請完整選擇工項與類型")
+        elif data_store.normalize_time(event_time_in) is None:
+            st.error("時間格式不對，請輸入像 14:00 或 9:30（24 小時制），或留白")
         elif _is_duplicate_submit((
             "todo", st.session_state.editing_id, task.strip(), location,
             str(start_date), str(end_date), work_item, type_, engineer, shareable,
+            remind_only, event_time_in.strip(),
         )):
             st.info("偵測到重複送出（10 秒內內容完全相同），已略過，沒有重複儲存。")
         else:
@@ -566,6 +583,8 @@ def render_todo_tab():
                         work_item=work_item, type=type_,
                         engineer=engineer,
                         shareable="TRUE" if shareable else "FALSE",
+                        remind_only="TRUE" if remind_only else "FALSE",
+                        event_time=data_store.normalize_time(event_time_in) or "",
                         last_reminder_at="",
                     )
                     if image_url is not None:
@@ -577,6 +596,8 @@ def render_todo_tab():
                         str(start_date), str(end_date), task, location,
                         work_item, type_, image_url=image_url or "",
                         engineer=engineer, shareable=shareable,
+                        remind_only=remind_only,
+                        event_time=data_store.normalize_time(event_time_in) or "",
                     )
 
             st.session_state.editing_id = None
@@ -611,9 +632,13 @@ def render_todo_tab():
         label = urgency.tier_label(t["end_date"], today)
         date_range = t["start_date"] if t["start_date"] == t["end_date"] else f"{t['start_date']} ~ {t['end_date']}"
         title = f"{label} {t['task']}" + (" 🔁" if data_store.is_shareable(t) else "")
+        if data_store.is_remind_only(t):
+            title = f"{label} 📣 {t['task']}" + (f"（{t['event_time']}）" if t.get("event_time") else "")
 
         with st.expander(title, expanded=(st.session_state.get("completing_id") == t["id"])):
-            st.write(f"**期限：** {date_range}")
+            st.write(f"**期限：** {date_range}" + (f"　⏰ {t['event_time']}" if t.get("event_time") else ""))
+            if data_store.is_remind_only(t):
+                st.write("**種類：** 📣 僅提醒（不需派工）")
             st.write(f"**工項／類型：** {t['work_item']} ／ {t['type']}")
             if t.get("location"):
                 st.write(f"**地點：** {t['location']}")
@@ -629,7 +654,7 @@ def render_todo_tab():
                 for d in dispatches:
                     rng = d["start_date"] if d["start_date"] == d["end_date"] else f"{d['start_date']}~{d['end_date']}"
                     st.caption(f"　{rng}：{d['workers']}")
-            else:
+            elif not data_store.is_remind_only(t):
                 st.caption("尚未安排移工，請到「👷 移工指派」分頁指派。")
 
             if t.get("image_url"):
@@ -759,7 +784,7 @@ def render_dispatch_assignment_tab():
     render_absence_manager()
 
     all_todos = data_store.get_todos()
-    active_todos = [t for t in all_todos if not _is_done(t)]
+    active_todos = [t for t in all_todos if not _is_done(t) and not data_store.is_remind_only(t)]
 
     if not active_todos:
         st.info("目前沒有可指派的代辦事項，請先到「📋 代辦事項」分頁新增。")
@@ -1090,8 +1115,17 @@ def render_dispatch_tab():
         t for t in todos
         if t["id"] not in dispatched_todo_ids
         and str(t.get("completed", "")).strip().upper() != "TRUE"
+        and not data_store.is_remind_only(t)
         and _t_in_range(t)
     ]
+    reminders_today = sorted(
+        [t for t in todos if data_store.is_remind_only(t) and not _is_done(t) and _t_in_range(t)],
+        key=lambda t: t.get("event_time") or "99:99",
+    )
+    if reminders_today:
+        st.info("📣 當天提醒事項（不需派工）：\n" + "\n".join(
+            f"・{(t['event_time'] + ' ') if t.get('event_time') else ''}{t['task']}"
+            + (f"（{t['location']}）" if t.get("location") else "") for t in reminders_today))
     if unassigned:
         st.warning(f"⚠️ 以下 {len(unassigned)} 筆事項在 {pick_date} 這天還沒有安排移工：")
         for t in unassigned:
