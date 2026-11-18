@@ -1132,6 +1132,70 @@ def render_dispatch_tab():
             st.write(f"・{t['task']}（{t['work_item']}／{t.get('location') or '無地點'}）")
 
 
+def _worker_usage(todos, dispatches_by_todo, period_start=None, period_end=None):
+    """算出每位移工在每個事項上用了幾「人日」（一位移工派一天＝1 人日，含頭尾每一天）。
+    回傳 [(事項, 移工, 人日)]；有給統計區間就只計算落在區間內的派工日。"""
+    recs = []
+    for t in todos:
+        for d in dispatches_by_todo.get(t["id"], []):
+            s_, e_ = _safe_date(d.get("start_date")), _safe_date(d.get("end_date"))
+            if not s_ or not e_:
+                continue
+            if period_start and s_ < period_start:
+                s_ = period_start
+            if period_end and e_ > period_end:
+                e_ = period_end
+            if e_ < s_:
+                continue
+            days = (e_ - s_).days + 1
+            for w in data_store.split_workers(d.get("workers", "")):
+                recs.append((t, w, days))
+    return recs
+
+
+def _render_worker_usage(filtered, dispatches_by_todo, work_item_filter):
+    """選好工項（上面的篩選）後，統計這些事項總共用了多少移工。"""
+    with st.expander("👷 移工使用量統計（人日）", expanded=(work_item_filter != "全部")):
+        st.caption(
+            "依上方篩選的事項統計。**人日**＝一位移工派工一天（含頭尾每一天，不扣假日）。"
+            "統計歸在事項建立時選的「工項」底下，例如工項選「土方」，它下面所有類型（含土方檢驗）的派工都算在一起。")
+        pc1, pc2 = st.columns(2)
+        p_from = pc1.date_input("只計算這天以後的派工（選填）", value=None, key="history_usage_from")
+        p_to = pc2.date_input("只計算這天以前的派工（選填）", value=None, key="history_usage_to")
+        recs = _worker_usage(filtered, dispatches_by_todo, p_from, p_to)
+        if not recs:
+            st.info("篩選範圍內沒有任何派工紀錄。")
+            return
+        df = pd.DataFrame([{
+            "工項": t["work_item"], "類型": t["type"], "事項": t["task"], "移工": w, "人日": d,
+        } for t, w, d in recs])
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("總人日", int(df["人日"].sum()))
+        m2.metric("不重複移工人數", df["移工"].nunique())
+        m3.metric("有派工的事項數", df["事項"].nunique())
+
+        def _group(cols, title):
+            g = (df.groupby(cols, as_index=False)
+                   .agg(人日=("人日", "sum"), 移工人數=("移工", "nunique"), 事項數=("事項", "nunique"))
+                   .sort_values("人日", ascending=False))
+            st.markdown(f"**{title}**")
+            st.dataframe(g, width="stretch", hide_index=True)
+
+        if work_item_filter == "全部":
+            _group(["工項"], "各工項合計")
+        _group(["工項", "類型"], "依類型（工項 → 類型）")
+        _group(["事項"], "依事項")
+        w = (df.groupby("移工", as_index=False).agg(人日=("人日", "sum"), 事項數=("事項", "nunique"))
+               .sort_values("人日", ascending=False))
+        st.markdown("**依移工**")
+        st.dataframe(w, width="stretch", hide_index=True)
+
+        st.download_button(
+            "下載明細 CSV", df.to_csv(index=False).encode("utf-8-sig"),
+            file_name="移工使用量明細.csv", mime="text/csv", key="history_usage_csv")
+
+
 def render_history_tab():
     st.subheader("📜 歷史記錄查詢")
     st.caption("這裡可以查到所有代辦事項，包含已完成、已不在主清單顯示的項目。")
@@ -1201,6 +1265,8 @@ def render_history_tab():
         })
 
     st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+    _render_worker_usage(filtered, dispatches_by_todo, work_item_filter)
 
     live = [t for t in filtered if not t.get("_archived")]
     with st.expander("✏️ 修正完成狀態（例如不小心標錯）"):
