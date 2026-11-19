@@ -50,7 +50,8 @@ TODO_HEADERS = [
 ]
 EXP_HEADERS = ["id", "work_item", "source", "details", "mistakes", "created_at"]
 OPTION_HEADERS = ["category", "value"]
-DISPATCH_HEADERS = ["id", "todo_id", "start_date", "end_date", "workers", "created_at"]
+DISPATCH_HEADERS = ["id", "todo_id", "start_date", "end_date", "workers", "created_at",
+                    "created_by", "updated_by"]
 # 移工休假／回國：一筆紀錄＝一位移工在某段日期（含頭尾）不能派工
 # weekdays：空白＝連續休假（start~end 每一天都休）；填 "6" 或 "5,6"（週一=0 … 週日=6）＝在 start~end
 # 這段期間內「每週固定」這幾天休（例如每週日休）。
@@ -566,7 +567,7 @@ def get_dispatches_by_todo():
 
 
 @_write_op
-def add_dispatch(todo_id, start_date, end_date, workers):
+def add_dispatch(todo_id, start_date, end_date, workers, operator=""):
     row = {
         "id": _gen_id("dispatch"),
         "todo_id": todo_id,
@@ -574,6 +575,8 @@ def add_dispatch(todo_id, start_date, end_date, workers):
         "end_date": end_date,
         "workers": workers,
         "created_at": _now_iso(),
+        "created_by": operator,
+        "updated_by": "",
     }
     _dispatch_ws().append_row([row[h] for h in DISPATCH_HEADERS])
     get_dispatches.clear()
@@ -581,21 +584,21 @@ def add_dispatch(todo_id, start_date, end_date, workers):
 
 
 @_write_op
-def update_dispatch(dispatch_id, start_date, end_date, workers):
+def update_dispatch(dispatch_id, start_date, end_date, workers, operator=""):
     """修改一整筆派工紀錄的日期與移工名單（臨時換人、或調整連續日期的起迄）。"""
     ws = _dispatch_ws()
     idx, row_values = _find_row(ws, DISPATCH_HEADERS, dispatch_id)
     if not idx:
         raise ValueError(f"找不到 id={dispatch_id} 的派工紀錄（可能已被其他人刪除）")
     rec = _row_to_dict(DISPATCH_HEADERS, row_values)
-    rec.update(start_date=start_date, end_date=end_date, workers=workers)
+    rec.update(start_date=start_date, end_date=end_date, workers=workers, updated_by=operator)
     ws.update(values=[[rec[h] for h in DISPATCH_HEADERS]], range_name=f"A{idx}")
     get_dispatches.clear()
     return rec
 
 
 @_write_op
-def replace_dispatch_segment(dispatch_id, seg_start, seg_end, new_workers):
+def replace_dispatch_segment(dispatch_id, seg_start, seg_end, new_workers, operator=""):
     """
     把一筆「連續多天」的派工紀錄中的某一段日期換成別的移工，其餘日期維持原本的移工。
     例：10/6～10/10 派 A、B，10/8 那天 B 請假要換成 C → 會自動拆成
@@ -624,13 +627,18 @@ def replace_dispatch_segment(dispatch_id, seg_start, seg_end, new_workers):
 
     # 第一段沿用原本那一列（保留 id 與建立時間），其餘各段新增在表格最後面
     first = parts[0]
-    result = [dict(rec, start_date=first[0].isoformat(), end_date=first[1].isoformat(), workers=first[2])]
+    # 沒被改到的段落維持原本的人與派工人；被換人的那一段記錄是誰改的
+    def _by(w):
+        return operator if w != rec["workers"] else rec.get("updated_by", "")
+    result = [dict(rec, start_date=first[0].isoformat(), end_date=first[1].isoformat(),
+                   workers=first[2], updated_by=_by(first[2]))]
     data = [{"range": f"A{idx}", "values": [[result[0][h] for h in DISPATCH_HEADERS]]}]
 
     new_rows = []
     for ps, pe, pw in parts[1:]:
         row = {"id": _gen_id("dispatch"), "todo_id": rec["todo_id"], "start_date": ps.isoformat(),
-               "end_date": pe.isoformat(), "workers": pw, "created_at": _now_iso()}
+               "end_date": pe.isoformat(), "workers": pw, "created_at": _now_iso(),
+               "created_by": rec.get("created_by", ""), "updated_by": _by(pw)}
         result.append(row)
         new_rows.append([row[h] for h in DISPATCH_HEADERS])
     if new_rows:
@@ -743,11 +751,11 @@ def delete_absence(absence_id):
 
 
 @_write_op
-def add_dispatches(records):
+def add_dispatches(records, operator=""):
     """一次新增多筆派工紀錄（複製派工用）。records: [(todo_id, start, end, workers_str), ...]"""
     rows = [{
         "id": _gen_id("dispatch"), "todo_id": tid, "start_date": s_, "end_date": e_,
-        "workers": w, "created_at": _now_iso(),
+        "workers": w, "created_at": _now_iso(), "created_by": operator, "updated_by": "",
     } for tid, s_, e_, w in records]
     if rows:
         _dispatch_ws().append_rows([[r[h] for h in DISPATCH_HEADERS] for r in rows])
