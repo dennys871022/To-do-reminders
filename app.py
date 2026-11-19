@@ -730,7 +730,8 @@ def render_copy_dispatch(todos_by_id, all_dispatches):
                 st.info("偵測到重複送出，已略過。")
                 return
             with st.spinner("複製中，請稍候…"):
-                data_store.add_dispatches([(t["id"], str(dst), str(dst), data_store.join_workers(ws)) for t, ws in to_add])
+                data_store.add_dispatches([(t["id"], str(dst), str(dst), data_store.join_workers(ws)) for t, ws in to_add],
+                                           operator=st.session_state.get("operator", ""))
             _audit("複製派工", f"{src} → {dst}", f"{len(to_add)} 個事項")
             lines = [f"📋 **複製派工**　{src} → {dst}"] + [f"・{t['task']}：{'、'.join(ws)}" for t, ws in to_add]
             _send_discord_async("\n".join(lines))
@@ -978,9 +979,11 @@ def render_dispatch_assignment_tab():
             if editing_dispatch:
                 with st.spinner("更新中，請稍候…"):
                     if partial:
-                        data_store.replace_dispatch_segment(editing_dispatch["id"], str(d_start), str(d_end), workers_str)
+                        data_store.replace_dispatch_segment(editing_dispatch["id"], str(d_start), str(d_end), workers_str,
+                                                                operator=st.session_state.get("operator", ""))
                     else:
-                        data_store.update_dispatch(editing_dispatch["id"], str(d_start), str(d_end), workers_str)
+                        data_store.update_dispatch(editing_dispatch["id"], str(d_start), str(d_end), workers_str,
+                                                   operator=st.session_state.get("operator", ""))
                 st.session_state.editing_dispatch_id = None
                 _audit("更新派工" + ("（部分日期）" if partial else ""), todo["task"],
                        f"{_fmt_range(editing_dispatch['start_date'], editing_dispatch['end_date'])} {editing_dispatch['workers']} → {_fmt_range(str(d_start), str(d_end))} {workers_str}")
@@ -988,7 +991,8 @@ def render_dispatch_assignment_tab():
                 _notify_discord_dispatch_update(todo, editing_dispatch, d_start, d_end, selected, partial)
             else:
                 with st.spinner("指派中，請稍候…"):
-                    record = data_store.add_dispatch(todo["id"], str(d_start), str(d_end), workers_str)
+                    record = data_store.add_dispatch(todo["id"], str(d_start), str(d_end), workers_str,
+                                                    operator=st.session_state.get("operator", ""))
                 _audit("新增派工", todo["task"], f"{_fmt_range(str(d_start), str(d_end))} {workers_str}")
                 _flash(f"✅ 已指派：{'、'.join(selected)}")
                 _notify_discord_dispatch(todo, record)
@@ -1007,7 +1011,7 @@ def render_dispatch_assignment_tab():
     for d in dispatches_for_todo:
         rng = _fmt_range(d["start_date"], d["end_date"])
         c1, c2, c3 = st.columns([5, 1, 1])
-        c1.write(f"**{rng}**：{d['workers']}")
+        c1.write(f"**{rng}**：{d['workers']}　👤 派工人：{_dispatch_by(d)}")
         if c2.button("✏️ 編輯", key=f"edit_dispatch_{d['id']}"):
             st.session_state.editing_dispatch_id = d["id"]
             st.rerun()
@@ -1017,6 +1021,16 @@ def render_dispatch_assignment_tab():
             _audit("刪除派工", todo["task"], f"{rng} {d['workers']}")
             _flash(f"已刪除 {rng} 的派工紀錄")
             st.rerun()
+
+
+def _dispatch_by(d):
+    """派工人文字：建立者；若最後是別人編輯，附上「最後編輯」。舊資料沒記錄則顯示『未記錄』。"""
+    c = (d.get("created_by") or "").strip()
+    u = (d.get("updated_by") or "").strip()
+    txt = c or "未記錄"
+    if u and u != c:
+        txt += f"（最後編輯：{u}）"
+    return txt
 
 
 def render_dispatch_tab():
@@ -1045,7 +1059,8 @@ def render_dispatch_tab():
         t = todos_by_id.get(d["todo_id"])
         if not t:
             continue  # 事項已被刪除，這筆派工紀錄是孤兒資料，略過不顯示
-        entry = by_todo.setdefault(t["id"], {"todo": t, "workers": set()})
+        entry = by_todo.setdefault(t["id"], {"todo": t, "workers": set(), "recs": []})
+        entry["recs"].append(d)
         entry["workers"].update(data_store.split_workers(d.get("workers", "")))
 
     today = datetime_now_taipei_date()
@@ -1099,6 +1114,8 @@ def render_dispatch_tab():
                 if t.get("engineer"):
                     st.write(f"指派人：{t['engineer']}")
                 st.write(f"移工：{workers_text}")
+                for d in entry["recs"]:
+                    st.caption(f"　└ {d['workers']}　👤 派工人：{_dispatch_by(d)}")
 
     dispatched_todo_ids = set(by_todo.keys())
 
@@ -1166,6 +1183,15 @@ def _render_worker_usage(filtered, dispatches_by_todo, work_item_filter):
         if not recs:
             st.info("篩選範圍內沒有任何派工紀錄。")
             return
+        q = st.text_input("🔎 文字搜尋（工項／類型／事項／移工，空白分隔多個關鍵字＝都要符合）",
+                          key="history_usage_search", placeholder="例如：土方 阿明")
+        terms = [x.lower() for x in q.split() if x.strip()]
+        if terms:
+            recs = [r for r in recs if all(
+                x in " ".join([r[0]["work_item"], r[0]["type"], r[0]["task"], r[1]]).lower() for x in terms)]
+            if not recs:
+                st.info("沒有符合搜尋文字的派工紀錄。")
+                return
         df = pd.DataFrame([{
             "工項": t["work_item"], "類型": t["type"], "事項": t["task"], "移工": w, "人日": d,
         } for t, w, d in recs])
